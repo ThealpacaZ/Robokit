@@ -1,0 +1,31 @@
+# 无硬件测试配置：mock 机械臂 + mock 相机
+# 用于在没有机械臂/相机/ROS2 的机器上验证采集→清洗→可视化→RLDS 全链路。
+
+robot:
+  arms:
+    right_arm:
+      type: mock
+      dof: 6
+  cameras:
+    cam_high:
+      type: mock
+      height: 480
+      width: 640
+    cam_wrist:
+      type: mock
+      height: 480
+      width: 640
+
+collect:
+  save_path: ./datasets
+  task_name: mock task
+  freq: 30
+  min_frames: 30
+  camera_timeout: 1.0
+  show_image: false
+
+deploy:
+  host: localhost
+  port: 8080
+  control_freq: 30
+  action_horizon: 30

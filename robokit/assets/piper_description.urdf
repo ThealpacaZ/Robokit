@@ -1,0 +1,76 @@
+<?xml version="1.0"?>
+<!--
+  Kinematics-only Piper URDF used by the production Pinocchio IK backend.
+
+  Joint origins and axes are from agilexrobotics/piper_ros
+  src/piper_description/urdf/piper_no_gripper_description.urdf.  Visual,
+  collision and inertial data are intentionally omitted: this model is loaded
+  only for FK/Jacobian/IK and must not depend on external mesh packages.
+
+  Limits are the six-axis values read from this robot's controller Flash.  The
+  runtime still takes the authoritative limits from joint_limits_deg and
+  verifies that they agree with this file before solving.
+-->
+<robot name="piper_kinematics">
+  <link name="base_link"/>
+  <link name="link1"/>
+  <link name="link2"/>
+  <link name="link3"/>
+  <link name="link4"/>
+  <link name="link5"/>
+  <link name="link6"/>
+
+  <joint name="joint1" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.123" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.6179938779914944" upper="2.6179938779914944"
+           effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="joint2" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0 0 0" rpy="1.5708 -0.1359 -3.1416"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="3.141592653589793"
+           effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="joint3" type="revolute">
+    <parent link="link2"/>
+    <child link="link3"/>
+    <origin xyz="0.28503 0 0" rpy="0 0 -1.7939"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.9670597283903604" upper="0"
+           effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="joint4" type="revolute">
+    <parent link="link3"/>
+    <child link="link4"/>
+    <origin xyz="-0.021984 -0.25075 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.7453292519943295" upper="1.7453292519943295"
+           effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="joint5" type="revolute">
+    <parent link="link4"/>
+    <child link="link5"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.2217304763960306" upper="1.2217304763960306"
+           effort="100" velocity="5"/>
+  </joint>
+
+  <joint name="joint6" type="revolute">
+    <parent link="link5"/>
+    <child link="link6"/>
+    <origin xyz="0.000088259 -0.091 0" rpy="1.5708 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-3.141592653589793" upper="3.141592653589793"
+           effort="100" velocity="3"/>
+  </joint>
+</robot>

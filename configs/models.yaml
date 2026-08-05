@@ -1,0 +1,72 @@
+# 真机推理模型登记表 —— `--model` 的名字在这里定义。
+#
+# 一条记录只回答「这个 checkpoint 是什么」：哪一族权重、装在哪、动作空间是什么、
+# 预测多少步。**不回答「怎么跑」**：模式（sync/RTC）、执行 horizon、总步数上限、
+# 安全护栏全部是命令行开关，见 scripts/serve_policy.py 与 scripts/run_policy.py。
+#
+# checkpoint 是 GPU 服务器上的路径，只有服务端读它；真机端只读 action_space /
+# robot_config / port / horizon 这几项，因此两端可以共用同一份文件。
+#
+# 加一个新模型 = 在 models: 下加一条记录，不需要改任何 Python 或 shell。
+
+defaults:
+  camera: cam_high
+  arm: right_arm
+  instruction: stack cups
+  device: cuda
+  robot_config: configs/piper_single.yaml
+  # 论文 arXiv:2506.07339 的实机默认值。s_min 逐模型给，其余共用。
+  rtc:
+    delay_buffer_size: 10
+    num_inference_steps: 5
+    max_guidance_weight: 5.0
+    prefix_attention_schedule: EXP
+
+models:
+  # ── OpenVLA-OFT LoRA：401 段 StackCups、EEF delta ─────────────────────────
+  openvla-oft:
+    family: openvla_oft
+    checkpoint: /root/autodl-tmp/openvla_oft_deploy/stackcups-step-025000
+    action_space: eef_delta
+    chunk_size: 30
+    port: 8080
+    horizon: 30
+    min_execution_horizon: 15
+    notes: |
+      continuous L1 action head；每行是 7 维 local EEF delta + continuous gripper。
+      当前服务只支持 sync，不使用 RTC prefix guidance。
+
+  # ── PI0.5 全量微调：EEF delta 数据训练 ────────────────────────────────────
+  pi05-eef:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/full_finetunes/stackcups_202_400_eef_pi05_last
+    action_space: eef_delta
+    chunk_size: 50
+    port: 8080
+    # 每个 chunk 默认执行前 30 步（--horizon 覆盖）
+    horizon: 30
+    # RTC 的 s_min（--horizon 在 --mode rtc 下覆盖这一项）
+    min_execution_horizon: 25
+    # 每行 = [local dx,dy,dz,droll,dpitch,dyaw, next_gripper]，米 / 真弧度 /
+    # xyz 外旋欧拉序，逐帧以上一帧 EEF 为基准。
+    notes: |
+      RTC 对这个动作契约在理论上是不成立的：LeRobot RTCProcessor 把 action 向量
+      当作可跨 chunk 对齐的轨迹坐标做 prefix guidance，而这里每行是「相对上一帧
+      的局部 SE(3) delta」。数字孪生复盘中 RTC 第四个 guided chunk 位移均值涨到
+      10.12mm 并累积撞上 workspace 边界，同 checkpoint 的 sync 完成 180/180 且
+      0 违规。要跑 RTC 请优先用 pi05-joint。
+
+  # ── PI0.5 全量微调：关节角数据训练 ────────────────────────────────────────
+  pi05-joint:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/full_finetunes/stackcups_150_400_joint_pi05_full
+    action_space: joint
+    chunk_size: 50
+    port: 8081
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    # 每行 = [j1..j6, gripper]，六轴是下一帧**绝对**目标角（真弧度），不进 IK。
+    notes: |
+      绝对关节目标正是 RTC prefix guidance 假设的「可跨 chunk 对齐的轨迹坐标」，
+      因此 RTC 在这个模型上语义成立。

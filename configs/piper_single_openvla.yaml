@@ -1,0 +1,84 @@
+# 单臂 Piper + 单 RealSense —— OpenVLA 部署配置
+#
+# 与 piper_single.yaml 的唯一区别是 deploy.action_horizon: 10 → 1。
+#
+# 原因：OpenVLA base 是**单步策略**，一次推理只返回 1 个 7 维动作，不支持 action
+# chunking（那是 OpenVLA-OFT 才加的能力）。piper_single.yaml 里 action_horizon: 10
+# 的注释写得很清楚——"服务端 chunk=10"——那是给 MemoryVLA 的。
+#
+# 用 10 去跑 OpenVLA 会出现一个很有迷惑性的现象：**每一步动作都是对的，但机械臂只走
+# 演示路程的 1/10**。因为消费端按 horizon 推进画面游标（source_index 每轮 +10），
+# 而实际只执行了 1 步。实测 policy-viewer run 20260727-110258-0-t1：
+#     vs_demo_xyz_ratio_median = 0.996   每步幅度几乎 1:1
+#     vs_demo_xyz_mae_mm       = 0.589   亚毫米
+#     path_ratio_vs_demo       = 0.097   总路程只有 9.7%
+# 看上去像"3D 模型没收到指令"，其实是观测与动作的推进步长不一致。
+#
+# 换回 MemoryVLA 或将来上 OpenVLA-OFT 时，用回 piper_single.yaml。
+
+robot:
+  arms:
+    right_arm:
+      type: piper                # 已注册类型: piper | mock（新臂在 robokit/arms/ 中注册）
+      dof: 6
+      port: can0                 # Piper 的 CAN 接口
+      speed: 10
+      reset_on_disconnect: true
+      eef_backend: host_ik       # policy EEF delta 在主机求连续 IK，再走 MOVE_J
+      joint_limits_deg:
+        - [-150, 150]
+        - [0, 180]
+        - [-170, 0]
+        - [-100, 100]
+        - [-70, 70]
+        - [-180, 180]
+      host_ik:
+        max_step_deg: 5.0
+        continuity_weight: 0.03
+        limit_margin_deg: 0.01
+        position_tolerance_mm: 1.0
+        rotation_tolerance_deg: 1.0
+        max_seed_tracking_deg: 1.0
+        max_nfev: 200
+  cameras:
+    cam_high:
+      type: realsense            # 直连取帧，避免 ROS2/DDS 图像传输丢帧
+      serial: "244222070143"     # 当前 D435i；更换设备时修改或删除此项
+      width: 320                 # 4:3；裁剪为 240x240 后足够生成模型的 224x224 输入
+      height: 240                # 相比 640x480，单帧内存与 HDF5 图像体积减少 75%
+      fps: 60                    # 采集仍为 30Hz，但每次能读取到更新的相机帧
+      auto_exposure_priority: false  # 暗光时不允许相机主动降低帧率
+
+collect:
+  save_path: ./datasets          # 数据保存根目录，实际写入 save_path/task_name/
+  task_name: stack cups
+  freq: 30                       # 采集频率 Hz
+  min_frames: 30                 # 少于该帧数的 episode 丢弃
+  camera_timeout: 1.0            # 相机超过该秒数无新帧则中止 episode
+  show_image: false             # 采集时实时显示相机画面（回车在终端或预览窗口里按都算）
+
+deploy:
+  host: localhost                # 推理服务器地址
+  port: 8080
+  control_freq: 30               # 客户端执行动作的频率 Hz
+  action_horizon: 1              # OpenVLA 单步策略：服务端 chunk=(1,7)，见文件头注释
+  gripper_rate: 0.12             # 夹爪单步开度变化上限（满行程比例，示教实测最大约 0.11）
+  camera_min_luminance: 60.0
+  camera_max_luminance: 220.0
+  camera_timeout_s: 0.25
+  camera_duplicate_run: 3
+
+  # 动作安全闸（robokit/safety.py）。下发前逐条检查，超限立即中止而不是继续下发。
+  # 2026-07-27：真机链路默认开启；--no-guard 仅保留为显式诊断对照。
+  safety:
+    enabled: true
+    max_delta_xyz: 0.015         # 74段实测 p99=11.51mm、max=14.86mm
+    max_delta_rpy: 0.0872665     # SO(3)物理旋转角5°
+    max_target_step: 0.05        # 相邻 commanded target 跳变上限 m
+    max_tracking_err: 0.08       # 反馈落后上一条 target 的上限 m
+                                 # （continuous 基准下仿真实测稳态领先约 26mm，留 3 倍余量）
+    gripper_max_rate: 1.0        # 单步夹爪变化上限
+    workspace:                   # 绝对目标位姿的工作区盒子（米），按实际台面改
+      x: [-0.10, 0.70]
+      y: [-0.50, 0.50]
+      z: [0.00, 0.60]

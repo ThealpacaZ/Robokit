@@ -1,0 +1,57 @@
+diff --git a/vla-scripts/finetune.py b/vla-scripts/finetune.py
+--- a/vla-scripts/finetune.py
++++ b/vla-scripts/finetune.py
+@@ -100,3 +100,4 @@
+     resume: bool = False                             # If True, resumes from checkpoint
+     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
++    resume_checkpoint_dir: Optional[Path] = None     # Directory containing saved adapter/head checkpoint files
+     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
+@@ -194,2 +195,5 @@
+     checkpoint_path = os.path.join(path, f"{module_name}--{step}_checkpoint.pt")
++    latest_checkpoint_path = os.path.join(path, f"{module_name}--latest_checkpoint.pt")
++    if not os.path.isfile(checkpoint_path) and os.path.isfile(latest_checkpoint_path):
++        checkpoint_path = latest_checkpoint_path
+     print(f"Loading checkpoint: {checkpoint_path}")
+@@ -258,3 +262,4 @@
+     if cfg.resume:
+-        state_dict = load_checkpoint(module_name, cfg.vla_path, cfg.resume_step)
++        checkpoint_dir = cfg.resume_checkpoint_dir or cfg.vla_path
++        state_dict = load_checkpoint(module_name, checkpoint_dir, cfg.resume_step)
+         module.load_state_dict(state_dict)
+@@ -845,3 +850,7 @@
+         )
+-        vla = get_peft_model(vla, lora_config)
++        if cfg.resume:
++            adapter_dir = Path(cfg.resume_checkpoint_dir or cfg.vla_path) / "lora_adapter"
++            print(f"Loading trainable LoRA adapter: {adapter_dir}")
++            vla = PeftModel.from_pretrained(vla, adapter_dir, is_trainable=True)
++        else:
++            vla = get_peft_model(vla, lora_config)
+         vla.print_trainable_parameters()
+@@ -869,3 +878,4 @@
+         if cfg.resume:
+-            state_dict = load_checkpoint("vision_backbone", cfg.vla_path, cfg.resume_step)
++            checkpoint_dir = cfg.resume_checkpoint_dir or cfg.vla_path
++            state_dict = load_checkpoint("vision_backbone", checkpoint_dir, cfg.resume_step)
+             vla.model.vision_backbone.load_state_dict(state_dict)
+@@ -931,3 +941,5 @@
+     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
++    resume_offset = cfg.resume_step if cfg.resume and cfg.resume_step is not None else 0
++    initial_lr = cfg.learning_rate if resume_offset < cfg.num_steps_before_decay else cfg.learning_rate * 0.1
++    optimizer = AdamW(trainable_params, lr=initial_lr)
+ 
+@@ -936,7 +948,11 @@
+-    # Create learning rate scheduler
++    # Keep the decay boundary tied to the global step after a weights-only resume.
++    remaining_decay_steps = cfg.num_steps_before_decay - resume_offset
++    scheduler_milestones = [remaining_decay_steps] if remaining_decay_steps > 0 else []
+     scheduler = MultiStepLR(
+         optimizer,
+-        milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
++        milestones=scheduler_milestones,
+         gamma=0.1,  # Multiplicative factor of learning rate decay
+     )
++    if cfg.resume:
++        print(f"Resuming from global step {resume_offset}; LR={initial_lr}; local decay milestones={scheduler_milestones}")
+ 

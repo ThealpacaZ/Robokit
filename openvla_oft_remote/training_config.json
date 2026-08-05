@@ -1,0 +1,37 @@
+{
+  "code_commit": "e4287e94541f459edc4feabc4e181f537cd569a8",
+  "transformers_commit": "bc339d9ad707454c0c115970db43c260067c61ab",
+  "source_repo": "shaohuan1/lememory",
+  "source_revision": "666ef5521cb3daf42d2f074bf4160cdaf92781bf",
+  "source_batches": [
+    "stack_cups_b0",
+    "stack_cups_b1",
+    "stack_cups_b2",
+    "stack_cups_b3",
+    "stack_cups_b4"
+  ],
+  "episodes": 401,
+  "action_space": "local_eef_delta_plus_continuous_gripper",
+  "action_chunk": 30,
+  "batch_size": "selected by the VRAM probe (24, 16, 12, then 8)",
+  "gradient_accumulation_steps": 1,
+  "learning_rate": 0.0005,
+  "decay_step": 75000,
+  "max_steps": 150000,
+  "lora_rank": 32,
+  "image_aug": true,
+  "use_l1_regression": true,
+  "use_film": false,
+  "use_proprio": false,
+  "num_images": 1,
+  "convergence": {
+    "metric": "median VLA Train/Loss over the preceding 2000 steps",
+    "minimum_step": 80000,
+    "checkpoint_interval": 5000,
+    "absolute_loss_threshold": 0.01,
+    "minimum_relative_improvement": 0.005,
+    "patience_checkpoints": 3,
+    "poll_seconds": 1800,
+    "note": "all 401 episodes are used for training, so convergence is an all-data training-loss plateau, not held-out validation"
+  }
+}

@@ -1,0 +1,22 @@
+# 机器人端 conda 环境（采集 + 部署客户端）
+# 创建: conda env create -f environment.yml
+# 默认 RealSense 直连配置只需 conda activate robokit。
+# 使用 ROS2 相机时再 source /opt/ros/jazzy/setup.bash（提供 rclpy / cv_bridge）。
+# python 固定 3.12，同时匹配 ROS2 jazzy 的 rclpy ABI
+name: robokit
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy<2          # jazzy 的 cv_bridge 基于 numpy 1.x 编译
+  - pinocchio=3.6.0  # production pinocchio_ik backend
+  - pip
+  - pip:
+      - scipy
+      - h5py
+      - opencv-python
+      - pyyaml
+      - matplotlib
+      - tqdm
+      - piper_sdk
+      - pyrealsense2==2.56.5.9235

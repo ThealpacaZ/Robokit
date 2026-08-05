@@ -1,0 +1,7 @@
+# Pinned to the LeRobot revision against which the scripts in this directory
+# were checked. `pi` installs PI0/PI05, `peft` supplies LoRA adapters, and
+# `training` includes the LeRobot dataset/video and trainer dependencies.
+lerobot[pi,peft,training] @ git+https://github.com/huggingface/lerobot.git@f37be3edbee60f3a09a5183788b91eb19f0c07d1
+h5py
+scipy
+sentencepiece

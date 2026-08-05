@@ -1,0 +1,111 @@
+# 单臂 Piper + 单 RealSense 相机配置
+# 机械臂/相机的数量、名称均任意，增删条目即可。
+
+robot:
+  arms:
+    right_arm:
+      type: piper                # 已注册类型: piper | mock（新臂在 robokit/arms/ 中注册）
+      dof: 6
+      port: can0                 # Piper 的 CAN 接口
+      # 2026-07-28：按要求完全解开限速。speed=10 时闭环速率掉到几 Hz（训练是
+      # 30Hz），本身就是分布偏移；且 frame11 的 0x04 在 speed=10 下照样复现，
+      # 说明限速换不来正确性。恢复 100 后必须复看 trace 里的 arrival 耗时。
+      speed: 100                 # 运动速度百分比，1..100
+      reset_on_disconnect: true  # writable 会话任何退出均 reset 并验证六轴失能
+      # 模型输出 EEF delta 不变；绝对目标由 Pinocchio 连续有界 IK 转为 JointCtrl。
+      eef_backend: pinocchio_ik
+      # 当天从主控 Flash 查询到的六轴限位（度）；换机械臂或改固件参数后必须重查。
+      joint_limits_deg:
+        - [-150, 150]
+        - [0, 180]
+        - [-170, 0]
+        - [-100, 100]
+        - [-70, 70]
+        - [-180, 180]
+      pinocchio_ik:
+        # 优化器内部同时受机械限位和 feedback seed ±5° 约束，不做事后单轴裁剪。
+        max_step_deg: 5.0
+        continuity_weight: 0.03
+        limit_margin_deg: 0.01
+        position_tolerance_mm: 1.0
+        rotation_tolerance_deg: 1.0
+        # 只衡量物理反馈相对机械限位的超限量；≤10°投影 seed，>10°拒绝。
+        seed_limit_tolerance_deg: 10.0
+        max_nfev: 200
+        allow_best_effort: false
+        eef_frame: link6
+        model_validation_position_mm: 0.25
+        model_validation_rotation_deg: 0.02
+      # 旧 SDK FK + SciPy 后端保留作显式 A/B；不会被 pinocchio_ik 静默调用求解。
+      host_ik:
+        # 74 段示教实测最大单帧关节变化 4.65°；5° 可覆盖全部，同时能拦住
+        # 无连续性 IK 在腕奇异点产生的约 41° 分支跳变。
+        max_step_deg: 5.0
+        # 腕部奇异点附近，0.001 对 0.1mm/0.1° policy 噪声会让 j4/j6
+        # 偶发顶到 5°局部硬边界；0.03 将同一扰动的最坏步长压到 <0.75°。
+        continuity_weight: 0.03
+        limit_margin_deg: 0.01
+        # 全部 15,447 帧扫描的最坏同分支残差为 0.76mm/0.87°；1/1 阈值
+        # 通过全量数据，仍在下发前拒绝真正不可达或必须跳支的目标。
+        position_tolerance_mm: 1.0
+        rotation_tolerance_deg: 1.0
+        max_seed_tracking_deg: 1.0  # 上条 joint target 落后超过1°时不再追加 EEF 目标
+        # 仅旧 host_ik 使用；Pinocchio 的 10°规则见上方独立配置。
+        seed_limit_tolerance_deg: 0.3
+        max_nfev: 200
+  cameras:
+    cam_high:
+      type: realsense            # 直连取帧，避免 ROS2/DDS 图像传输丢帧
+      serial: "261222074421"     # 当前 D435i；更换设备时修改或删除此项
+      # 2026-08-03 从 320x240 提到 640x480。仍是 4:3，train_aligned 的「整帧拉伸到
+      # 224x224 + 0.9 中心裁剪」几何与旧数据逐像素对应，只是下采样时细节更多。
+      # 实测 10s 对拍：帧间隔 mean 33.61ms / p99 33.72ms、相机→主机延迟 17.0ms，
+      # 与 320x240 无差别（>40ms 的间隔 0 个），代价只在体积。
+      width: 640                 # 原始帧保留 4:3；模型几何只应用于预览/训练/推理输入
+      height: 480                # 0.92MB/帧 → 30Hz 约 27.6MB/s，20s 的 episode 约 550MB
+      fps: 60                    # 采集仍为 30Hz，但每次能读取到更新的相机帧
+      auto_exposure_priority: false  # 暗光时不允许相机主动降低帧率
+
+collect:
+  save_path: ./datasets          # 数据保存根目录，实际写入 save_path/task_name/
+  task_name: Open the drawer, put the fruit and the cup from the table inside, and close the drawer.
+
+  freq: 30                       # 采集频率 Hz
+  min_frames: 30                 # 少于该帧数的 episode 丢弃
+  camera_timeout: 1.0            # 相机超过该秒数无新帧则中止 episode
+  show_image: true             # 采集时实时显示相机画面（回车在终端或预览窗口里按都算）
+  preview_preprocess: lememory   # 与 leMemory 推理共用 train_aligned：整帧拉伸 + 0.9 中心裁剪
+  # 模型实际吃 224x224，这里只是把同一套几何画大：480 是不插值的上限（竖向与传感器
+  # 1:1，横向 640→480 正是模型那步压扁）。只改预览；HDF5 仍保存 480x640 原图。
+  preview_image_size: [480, 480]
+  preview_screen_fraction: 0.5   # 每个预览窗口的宽高各占屏幕一半，即屏幕面积的 1/4
+  preview_every: 2               # 隔帧画（15Hz 显示）。640x480 源出 480x480 预览要 11.0ms/帧
+                                 # （出 224 是 6.9ms），每帧都画时 episode 中段偶发长间隔；
+                                 # 隔帧画只剩开头固定的那一个，实测其余全程 33.64ms
+
+# 这一段只描述**机器人怎么执行**。「用哪个模型、动作空间是什么、每块执行几步、
+# RTC 参数」全部在 configs/models.yaml 的模型登记表里，由 scripts/run_policy.py
+# 的 --model / --mode / --horizon 决定，不再在这里重复一份。
+deploy:
+  host: localhost                # 推理服务器地址（端口取登记表里模型的 port）
+  control_freq: 30               # 客户端执行动作的频率 Hz
+  gripper_rate: 0.12             # 夹爪单步开度变化上限（满行程比例，示教实测最大约 0.11）
+  camera_min_luminance: 60.0     # settled RGB 图亮度闸；训练/正常现场约 118
+  camera_max_luminance: 220.0    # 过暗/过曝时禁止把图送入 policy 后执行真机
+  camera_timeout_s: 0.25         # 部署帧接收年龄上限
+  camera_duplicate_run: 3        # 新时间戳下连续完全相同帧达到该数即中止
+
+  # 动作安全闸（robokit/safety.py）。下发前逐条检查，超限立即中止而不是继续下发。
+  # 2026-07-27：真机链路默认开启；--no-guard 仅保留为显式诊断对照。
+  safety:
+    enabled: true
+    max_delta_xyz: 0.015         # 74段实测 p99=11.51mm、max=14.86mm
+    max_delta_rpy: 0.0872665     # SO(3)旋转角5°；实测 p99=2.83°、max=4.53°
+    max_target_step: 0.05        # 相邻 commanded target 跳变上限 m
+    max_tracking_err: 0.08       # 反馈落后上一条 target 的上限 m
+                                 # （continuous 基准下仿真实测稳态领先约 26mm，留 3 倍余量）
+    gripper_max_rate: 1.0        # 单步夹爪变化上限
+    workspace:                   # 绝对目标位姿的工作区盒子（米），按实际台面改
+      x: [-0.10, 0.70]
+      y: [-0.50, 0.50]
+      z: [0.00, 0.60]
