@@ -10,6 +10,9 @@
     # 第一次上真机：零运动链路检查
     python scripts/run_policy.py --model pi05-eef --dry-run
 
+    # 换一条语言指令（-L = --L = --instruction），不必重启服务端
+    python scripts/run_policy.py --model pi05-joint -L "Stack one cup on top of another cup"
+
 四个开关是这个入口的全部要点：
 
     --model      要用哪个模型。名字在 configs/models.yaml，--list 可查。
@@ -44,14 +47,17 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import json
 import os
 from pathlib import Path
 import sys
+import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from robokit.deploy.loops import LoopConfig, run_rtc, run_sync
 from robokit.deploy.obsview import ObsView
+from robokit.deploy.videorec import VideoRecorder
 from robokit.deploy.registry import available, resolve_model
 from robokit.deploy.runtime import (
     DeploySession,
@@ -64,6 +70,40 @@ from robokit.deploy.runtime import (
 )
 from robokit.safety import ActionGuard
 from robokit.utils import load_config, log
+
+
+def write_rollout_meta(video_dir, *, spec, mode, horizon, instruction, status,
+                       seconds, trace_path, tag) -> None:
+    """一次 rollout 的名片，写在录像目录里。
+
+    录 demo 要反复 rollout，光看时间戳分不出哪次成了、跑了哪个任务。挑片工具
+    (scripts/demo_rollouts.py) 只读这个文件，所以非 demo 的录像目录不会被它管。
+    写失败只告警：demo 元数据丢了是小事，不值得让已经跑完的 rollout 报错退出。
+    """
+    payload = {
+        "recorded_at": datetime.now().isoformat(timespec="seconds"),
+        "model": spec.name,
+        "family": spec.family,
+        "mode": mode,
+        "horizon": horizon,
+        "instruction": instruction,
+        "status": status if status is not None else "unknown",
+        "seconds": round(float(seconds), 1),
+        "trace": str(trace_path),
+    }
+    try:
+        directory = Path(video_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "rollout.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        videos = sorted(p.name for p in directory.glob("*.mp4"))
+        log(tag, f"demo rollout → {directory} "
+                 f"(status={payload['status']}, {payload['seconds']}s, 视频 {videos or '无'})", "INFO")
+        log(tag, f"挑片: python scripts/demo_rollouts.py list   保留: "
+                 f"python scripts/demo_rollouts.py keep {directory.name}", "INFO")
+    except Exception as exc:  # noqa: BLE001 - 元数据不该影响 rollout 结果
+        log(tag, f"rollout.json 写入失败（不影响本次执行）: {exc}", "WARNING")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -87,8 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default=None, help="推理服务器地址，缺省取配置 deploy.host")
     parser.add_argument("--port", type=int, default=None,
                         help="推理服务器端口，缺省取登记表里该模型的 port")
-    parser.add_argument("--instruction", default=None, help="语言指令，缺省取登记表/配置")
-    parser.add_argument("--action-space", choices=("joint", "eef_delta"), default=None,
+    parser.add_argument("--instruction", "--L", "-L", default=None,
+                        help="语言指令（-L / --L 是同一个开关的短写），缺省取登记表/配置。"
+                             "服务端未用 --instruction 钉死时，这里给什么就发什么")
+    parser.add_argument("--action-space", choices=("joint", "eef_delta", "eef_delta_base"),
+                        default=None,
                         help="覆盖登记表；服务端回报的动作空间必须与此一致，否则拒绝执行")
     parser.add_argument("--eef-backend", choices=("host_ik", "pinocchio_ik"), default=None,
                         help="仅覆盖 Piper EEF 后端；host_ik=SDK FK + SciPy，"
@@ -108,6 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "比减小 horizon（丢弃模型预测的后续步）更可取")
     parser.add_argument("--gripper-mode", default="raw",
                         choices=("raw", "binary", "hysteresis"))
+    parser.add_argument("--gripper-squeeze", type=float, default=0.0,
+                        help="闭合方向额外多压的满行程比例（0=关闭）。训练标签是夹爪的"
+                             "实测开度，抓取时被物体挡住，回放该位置只贴不夹；0.05~0.10 "
+                             "通常足以产生夹持力。张开方向不受影响")
     parser.add_argument("--gripper-rate", type=float, default=None,
                         help="夹爪单步变化上限（满行程比例）；0 或负数关闭。"
                              "示教数据单帧最大变化约 0.11")
@@ -145,6 +192,13 @@ def build_parser() -> argparse.ArgumentParser:
     # 看图
     parser.add_argument("--show-image", action="store_true",
                         help="开窗实时显示发给模型的帧")
+    parser.add_argument("--record-video", action="store_true",
+                        help="把相机流全帧率录成 mp4 + 帧号 sidecar（独立线程，不碰控制循环）")
+    parser.add_argument("--demo", action="store_true",
+                        help="录 demo：开录像并写 rollout.json（模型/指令/时长/结果），"
+                             "配 scripts/demo_rollouts.py 挑片和清冗余")
+    parser.add_argument("--record-video-dir", default=None,
+                        help="录像输出目录，缺省与 trace 同前缀（*-video/）")
     parser.add_argument("--save-obs", default=None, help="把发出去的帧落成 PNG 到该目录")
     parser.add_argument("--save-obs-every", type=int, default=10,
                         help="每几次推理看/落一张（默认 10）")
@@ -202,7 +256,7 @@ def main() -> None:
         or config.get("collect", {}).get("task_name", "")
     )
     if not instruction:
-        parser.error("指令为空：用 --instruction 给一个，或在登记表/配置里填")
+        parser.error("指令为空：用 -L/--instruction 给一个，或在登记表/配置里填")
     control_freq = resolve_control_freq(deploy_cfg, args.control_freq)
     guard = ActionGuard.from_config(deploy_cfg) if safety_on else None
     gripper_rate = (
@@ -241,6 +295,11 @@ def main() -> None:
              f"{' (locked)' if deploy_cfg.get('control_freq_locked') else ''}", "INFO")
     log(tag, f"instruction={instruction!r}, config={args.config or spec.resolved_robot_config()}",
         "INFO")
+    if spec.instruction and instruction != spec.instruction:
+        log(tag, f"instruction 与登记表不一致（登记表：{spec.instruction!r}）。"
+                 "VLA 动作完全由语言条件决定，字符串与训练时的 task 不逐字相同就是"
+                 "另一个条件，行为会变；且服务端若用 --instruction 钉死过，这里给的"
+                 "会被它覆盖", "WARNING")
     if overridden_arms:
         log(tag, f"EEF backend override: {args.eef_backend} for {overridden_arms}", "WARNING")
     if safety_on:
@@ -254,13 +313,18 @@ def main() -> None:
                  "请有人守着急停", "WARNING")
     log(tag, f"wait_arrival={'on' if wait_arrival else 'off'}, "
              f"park_on_exit={'on' if park_on_exit else 'off'}, "
-             f"gripper_rate={gripper_rate}", "INFO")
+             f"gripper_rate={gripper_rate}, gripper_squeeze={args.gripper_squeeze}", "INFO")
     if reset_command is not None:
-        log(tag, f"回车中断后自动复位到 {reset_dataset!r} 的 episode {reset_episode} "
-                 f"第一帧（CAN {reset_port}）；--no-reset-on-interrupt 可关闭", "INFO")
+        where = (
+            "固定示教起点（写死在 reset_piper_to_demo_start.py，不读数据集）"
+            if reset_dataset is None
+            else f"{reset_dataset!r} 的 episode {reset_episode} 第一帧"
+        )
+        log(tag, f"回车中断后自动复位到 {where}（CAN {reset_port}）；"
+                 "--no-reset-on-interrupt 可关闭", "INFO")
     else:
         log(tag, "回车中断后不自动复位，机械臂停在中断位姿", "INFO")
-    if args.mode == "rtc" and action_space == "eef_delta" and spec.notes:
+    if args.mode == "rtc" and action_space.startswith("eef_delta") and spec.notes:
         log(tag, f"⚠ {spec.name} 在 RTC 下的已知问题：\n{spec.notes}", "WARNING")
 
     loop_config = LoopConfig(
@@ -275,6 +339,7 @@ def main() -> None:
         chunk_base=chunk_base,
         gripper_mode=args.gripper_mode,
         gripper_rate=gripper_rate,
+        gripper_squeeze=args.gripper_squeeze,
         guard=guard,
         guard_tracking=not args.dry_run,
         resync=args.resync,
@@ -310,10 +375,32 @@ def main() -> None:
             park_on_exit=park_on_exit,
             assume_safe=assume_safe,
         ) as session:
+            recorder = None
+            if args.record_video or args.demo:
+                video_dir = args.record_video_dir or (
+                    os.path.splitext(trace_path)[0] + "-video"
+                )
+                recorder = VideoRecorder(
+                    session.robot.cameras, video_dir, tag=f"{tag}-rec"
+                )
+                recorder.start()
+            started_at = time.time()
             try:
                 status = run(session, loop_config, view=view)
             except KeyboardInterrupt:
+                status = "interrupted"
                 log(tag, "interrupted", "WARNING")
+            finally:
+                if recorder is not None:
+                    recorder.stop()
+                if args.demo:
+                    # 一次 rollout 一份 rollout.json：挑片工具只认这个文件，没有它的
+                    # 目录一律当成非 demo 产物，不会被 prune 碰到。
+                    write_rollout_meta(
+                        video_dir, spec=spec, mode=args.mode, horizon=horizon,
+                        instruction=instruction, status=status,
+                        seconds=time.time() - started_at, trace_path=trace_path, tag=tag,
+                    )
     finally:
         view.close()
 

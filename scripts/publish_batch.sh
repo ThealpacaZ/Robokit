@@ -9,6 +9,7 @@
 #   ./scripts/publish_batch.sh --audit --repo lememory          # 核对整个仓库（所有任务）
 #   ./scripts/publish_batch.sh --audit "stack cups"             # 只核对一个任务
 #   KEEP_RLDS=1 ./scripts/publish_batch.sh "stack cups"         # 本机还要用 RLDS 就别让它删
+#   SKIP_RLDS=1 ./scripts/publish_batch.sh "stack cups"         # 只发 HDF5，不转也不发 RLDS
 #
 # 先决条件：hf 已登录且是 role=write 的 token（`hf auth login`）。
 #
@@ -279,7 +280,9 @@ got = sum(int(x) for s in info.get("splits", []) for x in s.get("shardLengths", 
 sys.exit(0 if got == want else 1)
 PYEOF
 }
-if rlds_done; then
+if [ "${SKIP_RLDS:-0}" = 1 ]; then
+  echo "==> SKIP_RLDS=1，不转 RLDS（只发 HDF5）"
+elif rlds_done; then
   echo "==> RLDS 已完整（$N 段），跳过转换"
 else
   [ -d "$OUT_DIR" ] && { echo "==> 检出半截/不匹配的 RLDS 产物，整体重转"; rm -rf "$OUT_DIR"; }
@@ -322,9 +325,11 @@ echo "==> 上传 HDF5（$N 段）-> $HF_REPO:$PREFIX/hdf5/"
   --include "$PREFIX/hdf5/*.hdf5" --exclude "*/_quarantine/*" --num-workers 8 || UPLOAD_HDF5_FAILED=1
 if [ "${UPLOAD_HDF5_FAILED:-0}" = 1 ]; then echo "HDF5 上传失败，重跑本命令续传" >&2; exit 1; fi
 
-echo "==> 上传 RLDS -> $HF_REPO:$PREFIX/robokit_dataset/"
-"$HF" upload-large-folder "$HF_REPO" "$OUT_ROOT" --repo-type dataset \
-  --include "$PREFIX/robokit_dataset/**" --num-workers 8
+if [ "${SKIP_RLDS:-0}" != 1 ]; then
+  echo "==> 上传 RLDS -> $HF_REPO:$PREFIX/robokit_dataset/"
+  "$HF" upload-large-folder "$HF_REPO" "$OUT_ROOT" --repo-type dataset \
+    --include "$PREFIX/robokit_dataset/**" --num-workers 8
+fi
 
 # 来源凭据：采集配置与清洗结论
 echo "==> 上传来源凭据"
@@ -335,11 +340,13 @@ echo "==> 上传来源凭据"
 
 # ---------- 6. 逐文件比对远端大小，通过了才写 manifest ----------
 # manifest 是这一批唯一的台账：本地数据删掉以后，--audit 就只认它。
+RLDS_PAIR="$OUT_DIR/robokit_dataset|$PREFIX/robokit_dataset|"
+[ "${SKIP_RLDS:-0}" = 1 ] && RLDS_PAIR=""
 echo "==> 校验远端"
 "$PY" - "$HF_REPO" "$MANIFEST" "$TASK" "$SLUG" "$BATCH" "$FROM" "$TO" "$N" "$(date -Iseconds)" "$QUAR_CSV" \
   "$DATA_DIR|$PREFIX/hdf5|.hdf5" \
   "$DATA_DIR|$PREFIX/source_meta|.json" \
-  "$OUT_DIR/robokit_dataset|$PREFIX/robokit_dataset|" <<'PYEOF'
+  ${RLDS_PAIR:+"$RLDS_PAIR"} <<'PYEOF'
 import json, os, sys
 from huggingface_hub import HfApi
 
@@ -386,7 +393,9 @@ PYEOF
 # ---------- 7. 删本地 RLDS ----------
 # RLDS 是 HDF5 的派生物，而且刚刚逐文件核对上了远端，本地留着就是纯粹的第二份数据。
 # 本机要用（训练/调试）就 KEEP_RLDS=1，或者从 HF 拉，或者重转一次（约 9 s/段）。
-if [ "${KEEP_RLDS:-0}" = 1 ]; then
+if [ "${SKIP_RLDS:-0}" = 1 ]; then
+  :
+elif [ "${KEEP_RLDS:-0}" = 1 ]; then
   echo "==> KEEP_RLDS=1，保留本地 RLDS：$OUT_DIR"
 else
   rm -rf "$OUT_DIR"

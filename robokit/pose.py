@@ -50,6 +50,21 @@ def wrap_euler(pose):
     return pose
 
 
+def apply_base_delta_pose(base_pose, delta_pose):
+    """把基座系增量应用到 base_pose，返回目标位姿 (6,)。
+
+    与 RLDS 转换的 `_base_delta_pose`（Δp = p_{t+1} − p_t，ΔR = R_{t+1} R_t⁻¹）严格互逆：
+    平移直接相加、旋转左乘。这是 OXE / OpenVLA 预训练数据的约定，增量不随手腕姿态旋转。
+    """
+    base = np.asarray(base_pose, dtype=np.float64)
+    delta = np.asarray(delta_pose, dtype=np.float64)
+
+    base_rot = Rotation.from_euler(EULER_SEQ, base[3:])
+    target_rpy = (Rotation.from_euler(EULER_SEQ, delta[3:]) * base_rot).as_euler(EULER_SEQ)
+    target_xyz = base[:3] + delta[:3]
+    return np.concatenate([target_xyz, target_rpy])
+
+
 def apply_local_delta_pose(base_pose, delta_pose):
     """把局部增量 delta_pose 应用到 base_pose，返回全局目标位姿 (6,)。"""
     base = np.asarray(base_pose, dtype=np.float64)

@@ -59,6 +59,19 @@ GRIPPER_SANE_MM = (-5.0, 120.0)   # 实测行程 99.6mm，两端留足余量
 _FULL_MM = _GRIPPER_FULL * 0.001  # SDK 原始单位是 0.001mm
 GRIPPER_SANE = (GRIPPER_SANE_MM[0] / _FULL_MM, GRIPPER_SANE_MM[1] / _FULL_MM)
 
+
+def _gripper_full_mm(ep) -> float:
+    """这段数据归一化夹爪时用的满行程：优先读采集配置（attrs.config_json 里的
+    arms.<name>.gripper_full_mm，2026-09-11 起可配置），没有就是历史的 70mm。"""
+    try:
+        cfg = json.loads(ep.attrs.get("config_json", "{}"))
+        for arm_cfg in cfg.get("robot", {}).get("arms", {}).values():
+            if "gripper_full_mm" in arm_cfg:
+                return float(arm_cfg["gripper_full_mm"])
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return _FULL_MM
+
 # eef_pose[3:] 的欧拉约定。Piper 固件 `GetArmEndPoseMsgs` 的 RX/RY/RZ 是**固定轴 xyz
 # 外旋**（≡ 内旋 ZYX）：按 xyz 解读时，记录位姿与官方 URDF 正运动学在实测 5 段 1129 帧上
 # 最大只差 1.03°；按内旋 XYZ 解读则处处差到 ~180°。
@@ -194,7 +207,8 @@ def check_actions(ep: EpisodeFile, joint_jump, eef_jump, rot_jump, euler):
         gripper = ep.gripper(arm)
         m["gripper_min"] = float(gripper.min())
         m["gripper_max"] = float(gripper.max())
-        lo, hi = GRIPPER_SANE
+        full_mm = _gripper_full_mm(ep)
+        lo, hi = GRIPPER_SANE_MM[0] / full_mm, GRIPPER_SANE_MM[1] / full_mm
         out = int(((gripper < lo) | (gripper > hi)).sum())
         if out:
             errors.append(f"gripper_range: {arm} has {out} frames outside [{lo}, {hi}] "

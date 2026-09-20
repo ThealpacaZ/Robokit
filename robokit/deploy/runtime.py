@@ -18,6 +18,7 @@ import time
 
 import numpy as np
 
+from robokit.comm import encode_image_jpeg
 from robokit.robot import Robot
 from robokit.trace import TraceWriter
 from robokit.utils import is_enter_pressed, log
@@ -31,9 +32,15 @@ RESET_SCRIPT = REPO_ROOT / "scripts" / "reset_piper_to_demo_start.py"
 
 
 def build_payload(obs, instruction):
-    """观测 → 推理请求。客户端只发原始帧，预处理由服务端 policy 负责。"""
+    """观测 → 推理请求。图像发 JPEG，预处理由服务端 policy 负责。
+
+    远端推理（隧道/代理）时原始帧 900KB 是 RTC 跑不起来的唯一原因：2026-08-14 在
+    bjb2 链路上实测 901KB 往返 1.2-3.7s（服务端自报推理只有 0.17s），折合 d≈40-110
+    步，H=50 无论 s_min 取什么都不成立；换成 JPEG 后真实画面只有 31KB，往返 0.25s、
+    d≈8 步。编码本身 1ms，服务端 decode_image_maybe_jpeg 同时收原始帧和 JPEG。
+    """
     return {
-        "images": {cam: frame["image"] for cam, frame in obs["cams"].items()},
+        "images": {cam: encode_image_jpeg(frame["image"]) for cam, frame in obs["cams"].items()},
         "state": {arm: {"joint": s["joint"], "eef_pose": s["eef_pose"], "gripper": s["gripper"]}
                   for arm, s in obs["arms"].items()},
         "instruction": instruction,
@@ -357,17 +364,8 @@ def resolve_reset_target(config, dataset=None, episode=0, port=None):
 
     返回 ``(dataset, episode, port)``。
     """
-    if dataset is None:
-        collect = config.get("collect", {})
-        task = str(collect.get("task_name", "") or "").strip()
-        if not task:
-            raise ValueError(
-                "配置里没有 collect.task_name，推不出复位数据集；"
-                "用 --reset-dataset 指定，或用 --no-reset-on-interrupt 关掉自动复位"
-            )
-        dataset = os.path.normpath(
-            os.path.join(str(collect.get("save_path", "./datasets")), task)
-        )
+    # 不传 --reset-dataset 就用复位脚本里写死的固定起点：这个位姿不变，为它在本机
+    # 常驻一份 HDF5 只会多出「数据不在就复位不了」这个失败模式。
     if port is None:
         ports = [
             str(arm_cfg["port"])
@@ -379,12 +377,15 @@ def resolve_reset_target(config, dataset=None, episode=0, port=None):
                 "配置里没有带 port 的 Piper 臂，推不出复位用的 CAN 口；用 --reset-port 指定"
             )
         port = ports[0]
+    if dataset is None:
+        return None, None, str(port)
     episode = int(episode)
     demo = os.path.join(dataset, f"{episode}.hdf5")
     if not os.path.isfile(demo):
         raise FileNotFoundError(
             f"中断复位要用的示教首帧不存在：{demo}。用 --reset-dataset/--reset-episode "
-            f"指到真实数据集，或用 --no-reset-on-interrupt 关掉自动复位"
+            f"指到真实数据集，去掉 --reset-dataset 走固定起点，"
+            f"或用 --no-reset-on-interrupt 关掉自动复位"
         )
     return dataset, episode, str(port)
 
@@ -397,16 +398,17 @@ def build_reset_command(dataset, episode, port, python=None):
     遗留状态」本来也不是 policy 跑完之后的情形。``--assume-safe`` 同理跳过 MOVE 确认
     —— 复位脚本自身的固件状态、驱动使能、分段步长、到位容差、超时检查全部照常执行。
     """
-    return [
-        python or sys.executable,
-        str(RESET_SCRIPT),
-        "--dataset", str(dataset),
-        "--episode", str(int(episode)),
+    command = [python or sys.executable, str(RESET_SCRIPT)]
+    # dataset 为 None = 用复位脚本写死的固定起点，命令里就不出现 --dataset/--episode。
+    if dataset is not None:
+        command += ["--dataset", str(dataset), "--episode", str(int(episode))]
+    command += [
         "--port", str(port),
         "--execute",
         "--skip-controller-reset",
         "--assume-safe",
     ]
+    return command
 
 
 def reset_to_demo_start(command, tag="client"):

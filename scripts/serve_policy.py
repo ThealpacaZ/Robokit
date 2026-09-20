@@ -32,14 +32,44 @@ from robokit.comm import BiSocket
 from robokit.deploy.obsview import ObsView
 from robokit.deploy.registry import available, resolve_model
 from robokit.policies.lerobot_dit import LeRobotDiTPolicy
+from robokit.policies.memoryvla import MemoryVLAPolicy, checkpoint_layout
+from robokit.policies.openvla_oft import OpenVLAOFTPolicy
 from robokit.utils import log
 
 REQUIRED_FILES = ("config.json", "policy_preprocessor.json", "policy_postprocessor.json")
 
 
-def check_checkpoint(path: str) -> None:
-    """本地 checkpoint 先做文件级体检；HF repo id 交给 LeRobot 自己解析。"""
+OFT_REQUIRED_FILES = (
+    "lora_adapter/adapter_model.safetensors",
+    "lora_adapter/adapter_config.json",
+    "action_head--latest_checkpoint.pt",
+    "dataset_statistics.json",
+)
+
+
+def check_checkpoint(path: str, family: str | None = None) -> None:
+    """本地 checkpoint 先做文件级体检；HF repo id 交给 LeRobot 自己解析。
+
+    不同 family 的 checkpoint 布局完全不同：LeRobot 是 config.json + policy_*.json，
+    MemoryVLA 是一个 .pt 加同级 json，OpenVLA-OFT 是 lora_adapter/ + 动作头 + 统计量。
+    用一套必需文件去卡所有 family，只会把好的 checkpoint 判成"不完整"。
+    """
     directory = Path(path).expanduser()
+    if family == "openvla_oft":
+        if not directory.is_dir():
+            raise SystemExit(f"OpenVLA-OFT checkpoint 不是目录: {directory}")
+        missing = [name for name in OFT_REQUIRED_FILES
+                   if not (directory / name).is_file() or (directory / name).stat().st_size == 0]
+        if missing:
+            raise SystemExit(f"OpenVLA-OFT checkpoint 不完整，缺 {missing}: {directory}")
+        return
+    if directory.suffix == ".pt":
+        # MemoryVLA 全量 checkpoint：<RUN>/checkpoints/x.pt + <RUN>/{config,dataset_statistics}.json
+        try:
+            checkpoint_layout(directory)
+        except (FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"checkpoint 不完整: {exc}") from None
+        return
     if not directory.is_dir():
         log("serve", f"{path} 不是本地目录，按 HF repo id 处理", "INFO")
         return
@@ -179,9 +209,16 @@ def main() -> None:
                              "--horizon 决定执行几步。RTC 必须返回完整 H，此项无效")
     parser.add_argument("--camera", default=None)
     parser.add_argument("--arm", default=None)
-    parser.add_argument("--instruction", default=None)
-    parser.add_argument("--action-space", choices=("eef_delta", "joint"), default=None,
+    parser.add_argument("--instruction", "--L", "-L", default=None,
+                        help="把指令钉死在服务端，忽略客户端每帧发来的那条。"
+                             "缺省不钉死：由客户端 run_policy.py -L 决定")
+    parser.add_argument("--action-space", choices=("eef_delta", "eef_delta_base", "joint"),
+                        default=None,
                         help="覆盖登记表；改了它就等于声明这个 checkpoint 训的是另一种动作")
+    parser.add_argument("--unnorm-key", default=None,
+                        help="OpenVLA-OFT/MemoryVLA 的反归一化键（dataset_statistics.json 里的名字）。"
+                             "多任务模型换任务时除了换 -L，还要换这个——它决定动作的物理尺度，"
+                             "用错不会报错，只会整体走样")
     parser.add_argument("--device", default=None)
     parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                         help="torch.compile 首次推理会多花几分钟，默认关")
@@ -211,7 +248,7 @@ def main() -> None:
     checkpoint = args.checkpoint or spec.checkpoint
     port = args.port if args.port is not None else spec.port
     action_space = args.action_space or spec.action_space
-    check_checkpoint(checkpoint)
+    check_checkpoint(checkpoint, family=spec.family)
 
     if spec.notes:
         log("serve", f"{spec.name} 备注：\n{spec.notes}", "WARNING")
@@ -220,12 +257,62 @@ def main() -> None:
     view = ObsView(
         save_dir=args.save_obs, every=args.save_obs_every, tag="serve-obs"
     )
-    policy = LeRobotDiTPolicy(
+    if spec.family == "memoryvla":
+        if args.mode == "rtc":
+            raise SystemExit(
+                f"{spec.name} 是 MemoryVLA，只支持 --mode sync：ΠGDM 前缀引导没有接到它的 DDIM 采样上"
+            )
+        policy = MemoryVLAPolicy(
+            checkpoint=checkpoint,
+            camera=args.camera or spec.camera,
+            instruction=args.instruction,
+            horizon=args.horizon,
+            action_space=action_space,
+            device=args.device or spec.device,
+            view=view,
+            **({**spec.policy_args, "unnorm_key": args.unnorm_key}
+               if args.unnorm_key else spec.policy_args),
+        )
+        if policy.chunk_size != spec.chunk_size:
+            raise SystemExit(
+                f"登记表说 {spec.name} 的 chunk_size={spec.chunk_size}，模型实际每次预测 "
+                f"{policy.chunk_size} 行；改登记表，别让真机端按错的 H 算 horizon"
+            )
+    elif spec.family == "openvla_oft":
+        # OpenVLA-OFT：LoRA adapter + L1 回归动作头，固定输出 (chunk_size, 7)。
+        # ΠGDM 前缀引导没有接到它的并行解码上，和 MemoryVLA 一样只支持 sync。
+        if args.mode == "rtc":
+            raise SystemExit(
+                f"{spec.name} 是 OpenVLA-OFT，只支持 --mode sync："
+                "RTC 的前缀引导没有接到它的并行解码上"
+            )
+        policy_args = dict(spec.policy_args)
+        if args.unnorm_key:
+            policy_args["unnorm_key"] = args.unnorm_key
+        policy = OpenVLAOFTPolicy(
+            checkpoint=checkpoint,
+            camera=args.camera or spec.camera,
+            instruction=args.instruction,
+            horizon=args.horizon,
+            action_space=action_space,
+            device=args.device or spec.device,
+            **policy_args,
+        )
+        if policy.chunk_size != spec.chunk_size:
+            raise SystemExit(
+                f"登记表说 {spec.name} 的 chunk_size={spec.chunk_size}，模型实际每次预测 "
+                f"{policy.chunk_size} 行；改登记表，别让真机端按错的 H 算 horizon"
+            )
+    else:
+      policy = LeRobotDiTPolicy(
         checkpoint=checkpoint,
         family=spec.family,
         camera=args.camera or spec.camera,
         arm=args.arm if args.arm is not None else spec.arm,
-        instruction=args.instruction if args.instruction is not None else (spec.instruction or None),
+        # 只在显式 --instruction 时才钉死。policy 里的取值是
+        # `self.instruction or obs["instruction"]`，默认灌进登记表那条会让客户端
+        # 的 -L 被静默覆盖 —— 客户端本来就从同一份登记表取默认值，不必在这儿再兜一次。
+        instruction=args.instruction,
         # RTC 必须返回完整 H：控制器按 H 对齐时间步，截断会让 prefix 引导错位。
         horizon=None if args.mode == "rtc" else args.horizon,
         action_space=action_space,
@@ -247,9 +334,15 @@ def main() -> None:
             args.schedule or rtc_defaults.get("prefix_attention_schedule", "EXP")
         ),
         view=view,
-    )
+      )
     log("serve", f"loaded {spec.name}: {policy.describe()}", "INFO")
     log("serve", f"checkpoint={checkpoint}", "INFO")
+    if args.instruction is not None:
+        log("serve", f"instruction 钉死为 {args.instruction!r}：客户端 -L 发来的会被忽略",
+            "WARNING")
+    else:
+        log("serve", f"instruction 随每帧请求走（客户端 -L 说了算），"
+                     f"登记表里这个模型训练时用的是 {spec.instruction!r}", "INFO")
 
     service = (
         RTCService(policy, cache_size=args.chunk_cache)

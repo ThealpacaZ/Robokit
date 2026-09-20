@@ -14,8 +14,12 @@ from robokit.utils import load_config
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 DEFAULT_REGISTRY = REPO_ROOT / "configs" / "models.yaml"
 
-FAMILIES = ("pi0", "pi05", "openvla_oft")
-ACTION_SPACES = ("eef_delta", "joint")
+FAMILIES = ("pi0", "pi05", "openvla_oft", "memoryvla")
+# eef_delta      每行是相对上一帧 EEF 的局部 SE(3) 增量（RLDS 1.1.0 契约）
+# eef_delta_base 每行是基座系增量（RLDS 1.2.0/1.3.0 的 action_delta_base，OXE/OpenVLA 约定）
+# joint          每行是下一帧绝对关节角
+# 三者数值不同且互不兼容，执行器按这个字段选 apply 函数，见 robokit/executor.py
+ACTION_SPACES = ("eef_delta", "eef_delta_base", "joint")
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,9 @@ class ModelSpec:
     instruction: str
     device: str
     rtc: dict = field(default_factory=dict)
+    # 族专属的构造参数（memoryvla 的 codebase/unnorm_key 等），原样透传给 policy 类；
+    # pi0/pi05 不需要，留空即可。
+    policy_args: dict = field(default_factory=dict)
     notes: str = ""
 
     def execution_horizon(self, mode: str, override: int | None = None) -> int:
@@ -86,6 +93,7 @@ def load_registry(path: str | os.PathLike | None = None) -> dict[str, ModelSpec]
     for name, raw in entries.items():
         entry = {**defaults, **(raw or {})}
         rtc = {**default_rtc, **(entry.pop("rtc", None) or {})}
+        policy_args = dict(entry.pop("policy_args", None) or {})
         missing = [key for key in ("family", "checkpoint", "action_space") if not entry.get(key)]
         if missing:
             raise ValueError(f"{registry_file}: 模型 {name!r} 缺少必填字段 {missing}")
@@ -120,6 +128,7 @@ def load_registry(path: str | os.PathLike | None = None) -> dict[str, ModelSpec]
             instruction=str(entry.get("instruction", "")),
             device=str(entry.get("device", "cuda")),
             rtc=rtc,
+            policy_args=policy_args,
             notes=str(entry.get("notes", "") or "").strip(),
         )
     return specs

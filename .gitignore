@@ -5,3 +5,5 @@ runs/
 *.hdf5
 *.hdf5.tmp
 *.egg-info/
+hf/
+PROJECT_MEMORY.md

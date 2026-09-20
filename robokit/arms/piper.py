@@ -15,7 +15,13 @@ from robokit.arms.piper_ik import DEFAULT_JOINT_LIMITS_DEG
 from robokit.utils import log
 
 _DEG2RAD = np.pi / 180.0
-_GRIPPER_FULL = 70.0 * 1000  # 满行程对应的 SDK 原始值 (0.001mm)
+# 夹爪满行程的缺省值（mm）。SDK 原始值单位 0.001mm。实测夹爪能张到 ~84mm，即按 70 归一化时
+# 读数会 >1（2026-09-11 cover 数据 74% 帧 >1，最大 1.196）。历史数据集与已训模型都是按 70
+# 归一化的，所以缺省保持 70 不变；新采集用配置项 arms.<name>.gripper_full_mm 指定实测满行程，
+# 该值随 config_json 一起写进 HDF5 attrs，转换/部署时可据此还原。
+_GRIPPER_FULL_MM_DEFAULT = 70.0
+# 兼容旧引用（clean.py 等按历史数据集的 70mm 归一化做统计）：SDK 原始值 (0.001mm)
+_GRIPPER_FULL = _GRIPPER_FULL_MM_DEFAULT * 1000
 
 # 松灵官方 URDF 的关节限位，直接复用 piper_ik 的权威表，不再抄一份。
 _JOINT_LIMITS_DEG = DEFAULT_JOINT_LIMITS_DEG
@@ -38,6 +44,10 @@ class PiperArm(Arm):
         if self.dof != 6:
             raise ValueError(f"Piper is a 6-DOF arm, got dof={self.dof}")
         self.port = cfg.get("port", "can0")
+        self.gripper_full_mm = float(cfg.get("gripper_full_mm", _GRIPPER_FULL_MM_DEFAULT))
+        if not (10.0 <= self.gripper_full_mm <= 200.0):
+            raise ValueError(f"[{self.name}] gripper_full_mm 不合理: {self.gripper_full_mm}")
+        self._gripper_full_raw = self.gripper_full_mm * 1000.0  # SDK 单位 0.001mm
         self.speed = int(cfg.get("speed", 10))  # 安全缺省：运动速度百分比
         if not 1 <= self.speed <= 100:
             raise ValueError(f"Piper speed must be in 1..100, got {self.speed}")
@@ -470,7 +480,7 @@ class PiperArm(Arm):
         xyz = np.array([eef.X_axis, eef.Y_axis, eef.Z_axis], dtype=np.float64) * 1e-6      # 0.001mm → m
         rpy = np.array([eef.RX_axis, eef.RY_axis, eef.RZ_axis], dtype=np.float64) * 0.001 * _DEG2RAD
 
-        gripper = self.sdk.GetArmGripperMsgs().gripper_state.grippers_angle / _GRIPPER_FULL
+        gripper = self.sdk.GetArmGripperMsgs().gripper_state.grippers_angle / self._gripper_full_raw
         return self._stamped(joint, np.concatenate([xyz, rpy]), gripper)
 
     def _validated_joint(self, joint, *, clip_limits=False):
@@ -709,7 +719,7 @@ class PiperArm(Arm):
 
     def _move_gripper(self, gripper):
         self._assert_writable()
-        raw = int(np.clip(gripper, 0.0, 1.0) * _GRIPPER_FULL)
+        raw = int(np.clip(gripper, 0.0, 1.0) * self._gripper_full_raw)
         self.sdk.GripperCtrl(raw, 1000, 0x01, 0)
 
     def set_cleanup_trace(self, trace):

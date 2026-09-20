@@ -1,0 +1,103 @@
+# 单臂 Piper + 单 RealSense：LeRobot π0 关节角权重执行配置。
+#
+# 模型输出每行：
+#   [j1, j2, j3, j4, j5, j6, gripper]
+# 六轴为下一帧绝对目标角（真弧度），不是 delta；夹爪为 [0,1] 连续开度。
+# deploy.action_space 固定为 joint，因此不会进入 EEF 累加或 IK。
+
+robot:
+  arms:
+    right_arm:
+      type: piper
+      dof: 6
+      port: can0
+      # 夹爪满行程（mm）；旧模型/旧数据按 70 归一化，重采前用 scripts/measure_gripper_stroke.py 量实测值再改
+      gripper_full_mm: 70.0
+      speed: 100
+      # writable 会话任何退出均 reset 并验证六轴失能。--safety off 会改成 false，
+      # 让臂带力停在 policy 的终止位姿上，保留现场供人工观察。
+      reset_on_disconnect: true
+      # joint 模式直接走 JointCtrl，不把模型动作交给 IK；PiperArm 可写连接仍会构造
+      # 一个 EEF 后端供统一生命周期使用，因此这里也明确使用生产 Pinocchio 后端，
+      # 不再构造旧 SDK-FK + SciPy host_ik。
+      eef_backend: pinocchio_ik
+      # 受保护模式下超限的 joint 目标整条拒绝（默认 reject）。--safety off 会把它
+      # 改成 clip：有限 6-D 目标逐轴钳到最近机械限位再下发，EEF/IK 路径仍严格拒绝。
+      joint_limits_deg:
+        - [-150, 150]
+        - [0, 180]
+        - [-170, 0]
+        - [-100, 100]
+        - [-70, 70]
+        - [-180, 180]
+      pinocchio_ik:
+        max_step_deg: 5.0
+        continuity_weight: 0.03
+        limit_margin_deg: 0.01
+        position_tolerance_mm: 1.0
+        rotation_tolerance_deg: 1.0
+        seed_limit_tolerance_deg: 10.0
+        max_nfev: 200
+        allow_best_effort: false
+        eef_frame: link6
+        model_validation_position_mm: 0.25
+        model_validation_rotation_deg: 0.02
+  cameras:
+    cam_high:
+      type: realsense
+      # 2026-08-06：这份配置从 git 恢复出来时还停在 7/30，序列号是已经换掉的那台，
+      # pipeline.start() 拿不存在的序列号 enable_device，报的是 "No device connected"，
+      # 看起来像相机没插。换相机时这里和 piper_single.yaml 必须一起改。
+      serial: "244222070143"     # 当前 D435i（2026-09-11 换机）；更换设备时修改或删除此项
+      # 采集在 2026-08-03 从 320x240 提到 640x480，joint 数据集里的帧就是 480x640；
+      # 推理侧必须跟训练一致，否则模型吃到的是不同下采样路径的同一场景。
+      width: 640
+      height: 480
+      fps: 60                    # 控制仍为 30Hz，但每次能读到更新的相机帧
+      auto_exposure_priority: false  # 暗光时不允许相机主动降低帧率
+
+collect:
+  save_path: ./datasets
+  task_name: stack cups
+  freq: 30
+  min_frames: 30
+  camera_timeout: 1.0
+  show_image: false
+
+# 这一段只描述**机器人怎么执行**。「用哪个模型、动作空间是什么、每块执行几步、
+# RTC 参数」全部在 configs/models.yaml 的模型登记表里，由 scripts/run_policy.py
+# 的 --model / --mode / --horizon 决定，不再在这里重复一份。
+#
+# 下面是**受保护**的生产阈值，对应 `--safety on`。默认的 `--safety off` 会在内存里
+# 把它们全部解除（见 robokit/deploy/runtime.py 的 relax_safety），不需要再为无护栏
+# 模式单独维护一份 YAML。
+deploy:
+  host: localhost
+  # joint 部署永久锁定 30Hz；run_policy 拒绝任何其他 --control-freq 覆盖。
+  control_freq: 30
+  control_freq_locked: true
+  gripper_rate: 0.12
+  camera_min_luminance: 60.0
+  camera_max_luminance: 220.0
+  camera_timeout_s: 0.25
+  camera_duplicate_run: 3
+
+  safety:
+    enabled: true
+    joint_limits_deg:
+      - [-150, 150]
+      - [0, 180]
+      - [-170, 0]
+      - [-100, 100]
+      - [-70, 70]
+      - [-180, 180]
+    gripper_max_rate: 1.0
+    # 以下 EEF 阈值在 joint 模式不参与判定，保留完整配置便于工具读取。
+    max_delta_xyz: 0.015
+    max_delta_rpy: 0.0872665
+    max_target_step: 0.05
+    max_tracking_err: 0.08
+    workspace:
+      x: [-0.10, 0.70]
+      y: [-0.50, 0.50]
+      z: [0.00, 0.60]

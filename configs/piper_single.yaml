@@ -7,6 +7,10 @@ robot:
       type: piper                # 已注册类型: piper | mock（新臂在 robokit/arms/ 中注册）
       dof: 6
       port: can0                 # Piper 的 CAN 接口
+      # 夹爪满行程（mm），读数与命令都按它归一化到 [0,1]。历史数据/已训模型按 70 归一化，
+      # 部署旧模型时保持 70；重新采集前先跑 scripts/measure_gripper_stroke.py 量出实测满行程
+      # （2026-09-11 数据里读到过 83.7mm）再改这里，采集配置会随 HDF5 attrs 一起保存。
+      gripper_full_mm: 70.0
       # 2026-07-28：按要求完全解开限速。speed=10 时闭环速率掉到几 Hz（训练是
       # 30Hz），本身就是分布偏移；且 frame11 的 0x04 在 speed=10 下照样复现，
       # 说明限速换不来正确性。恢复 100 后必须复看 trace 里的 arrival 耗时。
@@ -56,7 +60,7 @@ robot:
   cameras:
     cam_high:
       type: realsense            # 直连取帧，避免 ROS2/DDS 图像传输丢帧
-      serial: "261222074421"     # 当前 D435i；更换设备时修改或删除此项
+      serial: "244222070143"     # 当前 D435i（2026-09-11 换机）；更换设备时修改或删除此项
       # 2026-08-03 从 320x240 提到 640x480。仍是 4:3，train_aligned 的「整帧拉伸到
       # 224x224 + 0.9 中心裁剪」几何与旧数据逐像素对应，只是下采样时细节更多。
       # 实测 10s 对拍：帧间隔 mean 33.61ms / p99 33.72ms、相机→主机延迟 17.0ms，
@@ -69,11 +73,10 @@ robot:
 collect:
   save_path: ./datasets          # 数据保存根目录，实际写入 save_path/task_name/
   task_name: Open the drawer, put the fruit and the cup from the table inside, and close the drawer.
-
   freq: 30                       # 采集频率 Hz
   min_frames: 30                 # 少于该帧数的 episode 丢弃
   camera_timeout: 1.0            # 相机超过该秒数无新帧则中止 episode
-  show_image: true             # 采集时实时显示相机画面（回车在终端或预览窗口里按都算）
+  show_image: false             # 采集时实时显示相机画面（回车在终端或预览窗口里按都算）
   preview_preprocess: lememory   # 与 leMemory 推理共用 train_aligned：整帧拉伸 + 0.9 中心裁剪
   # 模型实际吃 224x224，这里只是把同一套几何画大：480 是不插值的上限（竖向与传感器
   # 1:1，横向 640→480 正是模型那步压扁）。只改预览；HDF5 仍保存 480x640 原图。

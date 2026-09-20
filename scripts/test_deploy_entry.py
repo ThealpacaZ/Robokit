@@ -30,6 +30,7 @@ from robokit.deploy.obsview import tensor_to_uint8
 from robokit.deploy.registry import load_registry, resolve_model
 from robokit.deploy.runtime import (
     RESET_SCRIPT,
+    build_payload,
     build_reset_command,
     relax_safety,
     reset_to_demo_start,
@@ -39,14 +40,17 @@ from robokit.deploy.runtime import (
 from robokit.utils import load_config
 
 
-def _load_reset_script():
-    """按路径加载复位脚本；它不是包的一部分，且 import 时不碰 SDK/CAN。"""
-    spec = importlib.util.spec_from_file_location(
-        "robokit_reset_piper_to_demo_start_entry", str(RESET_SCRIPT)
-    )
+def _load_script(filename):
+    """按路径加载 scripts/ 下的入口脚本；它们不是包的一部分，import 时不碰 SDK/权重。"""
+    path = ROOT / "scripts" / filename
+    spec = importlib.util.spec_from_file_location(f"robokit_entry_{path.stem}", str(path))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_reset_script():
+    return _load_script(RESET_SCRIPT.name)
 
 
 class RegistryTest(unittest.TestCase):
@@ -248,20 +252,24 @@ class InterruptResetTest(unittest.TestCase):
         open(path, "wb").close()
         return path
 
-    def test_defaults_come_from_the_robot_config(self):
-        self._make_episode(0)
+    def test_default_is_the_fixed_start_and_needs_no_dataset(self):
+        # 不传 dataset = 用复位脚本里写死的固定起点，本机不需要存任何 HDF5。
         dataset, episode, port = resolve_reset_target(self.config)
-        self.assertEqual(os.path.basename(dataset), "stack cups")
-        self.assertEqual(episode, 0)
+        self.assertIsNone(dataset)
+        self.assertIsNone(episode)
         # 复位必须打在 policy 刚才控制的那条臂上，而不是写死的 can0。
         self.assertEqual(port, self.config["robot"]["arms"]["right_arm"]["port"])
+        # 固定起点的命令里不能出现 --dataset/--episode，否则复位脚本又会去读文件。
+        command = build_reset_command(dataset, episode, port)
+        self.assertNotIn("--dataset", command)
+        self.assertNotIn("--episode", command)
 
     def test_missing_demo_episode_is_rejected_before_the_run_starts(self):
-        # 复位命令写错要在机械臂还停在示教起点时就报出来，而不是等 policy 跑完、
-        # 臂停在半空才发现复位跑不起来。
-        self._make_episode(0)
+        # 显式指了数据集就还是老规矩：复位命令写错要在机械臂还停在示教起点时就
+        # 报出来，而不是等 policy 跑完、臂停在半空才发现复位跑不起来。
+        dataset = os.path.dirname(self._make_episode(0))
         with self.assertRaisesRegex(FileNotFoundError, r"7\.hdf5"):
-            resolve_reset_target(self.config, episode=7)
+            resolve_reset_target(self.config, dataset=dataset, episode=7)
 
     def test_explicit_overrides_win_over_the_config(self):
         other = os.path.dirname(self._make_episode(3, task="other task"))
@@ -299,6 +307,44 @@ class InterruptResetTest(unittest.TestCase):
         self.assertFalse(reset_to_demo_start([sys.executable, "-c", "raise SystemExit(3)"]))
         self.assertFalse(reset_to_demo_start(["/nonexistent/reset-binary"]))
         self.assertTrue(reset_to_demo_start([sys.executable, "-c", ""]))
+
+
+class InstructionFlagTest(unittest.TestCase):
+    """-L 是改语言指令的开关：三种写法同一个字段，且它真的进了发出去的报文。"""
+
+    def setUp(self):
+        self.parser = _load_script("run_policy.py").build_parser()
+
+    def _parse(self, *argv):
+        return self.parser.parse_args(["--model", "pi05-joint", *argv])
+
+    def test_all_three_spellings_write_the_same_field(self):
+        for flag in ("-L", "--L", "--instruction"):
+            self.assertEqual(self._parse(flag, "wipe the table").instruction,
+                             "wipe the table")
+
+    def test_L_is_not_swallowed_by_list(self):
+        # --L 与 --list 只差大小写；argparse 的前缀匹配区分大小写，且 --L 是精确
+        # 匹配，所以两者互不影响。哪天有人加了 --Loop 之类，这条会先坏。
+        self.assertTrue(self._parse("--list").list)
+        self.assertIsNone(self._parse("--list").instruction)
+
+    def test_default_is_none_so_registry_and_config_can_fill_it(self):
+        self.assertIsNone(self._parse().instruction)
+
+    def test_the_instruction_reaches_the_wire_verbatim(self):
+        obs = {"cams": {}, "arms": {}}
+        self.assertEqual(build_payload(obs, "wipe the table")["instruction"],
+                         "wipe the table")
+
+    def test_the_prober_takes_the_same_flag(self):
+        """上真机前先用 probe 试新 prompt；两个入口的开关名必须一致。"""
+        probe = _load_script("probe_policy_server.py")
+        for flag in ("-L", "--L", "--instruction"):
+            with patch.object(sys, "argv",
+                              ["probe_policy_server.py", "--model", "pi05-joint",
+                               flag, "wipe the table"]):
+                self.assertEqual(probe.parse_args().instruction, "wipe the table")
 
 
 class ObsViewTest(unittest.TestCase):

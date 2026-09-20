@@ -7,6 +7,7 @@
     observations/images/{cam}    (T, H, W, 3) uint8
     observations/{arm}/joint     (T, dof)     float32
     observations/{arm}/eef_pose  (T, 6)       float32   # 臂不提供 EEF 位姿时缺省
+    observations/{arm}/eef_rotvec (T, 3)      float32   # 同一姿态的旋转向量（弧度），无欧拉 ±180° 翻转
     observations/{arm}/gripper   (T, 1)       float32
     timestamps/frame             (T,)         float64   # 采集主循环 tick 时间 (epoch 秒)
     timestamps/cams/{cam}/capture   (T,)      float64   # 相机侧采集时间 (ROS header stamp)
@@ -22,6 +23,9 @@ import threading
 import h5py
 import numpy as np
 
+from scipy.spatial.transform import Rotation
+
+from robokit.pose import EULER_SEQ
 from robokit.utils import log
 
 FORMAT_VERSION = "robokit-1.0"
@@ -105,7 +109,12 @@ class EpisodeRecorder:
             items.append((f"observations/{arm}/joint", state["joint"].astype(np.float32)))
             items.append((f"observations/{arm}/gripper", np.array([state["gripper"]], dtype=np.float32)))
             if state["eef_pose"] is not None:
-                items.append((f"observations/{arm}/eef_pose", state["eef_pose"].astype(np.float32)))
+                eef_pose = np.asarray(state["eef_pose"], dtype=np.float64)
+                items.append((f"observations/{arm}/eef_pose", eef_pose.astype(np.float32)))
+                # 欧拉 roll 在 ±180° 附近会整圈翻转（cover 数据里就有），给吃状态的模型留一份
+                # 连续的姿态表示。旋转向量与 eef_pose[3:] 描述同一姿态，按 EULER_SEQ 换算。
+                items.append((f"observations/{arm}/eef_rotvec",
+                              Rotation.from_euler(EULER_SEQ, eef_pose[3:]).as_rotvec().astype(np.float32)))
             items.append((f"timestamps/arms/{arm}", np.float64(state["ts"])))
         for cam, data in frame["cams"].items():
             items.append((f"observations/images/{cam}", data["image"]))

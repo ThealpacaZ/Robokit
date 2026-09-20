@@ -44,10 +44,20 @@ class LeRobotDiTPolicy:
         view=None,
     ):
         import torch
-        from lerobot.configs import RTCAttentionSchedule
+        # lerobot 版本兼容:0.4.4 起这些符号搬了家/不再 re-export,双路径 fallback
+        try:
+            from lerobot.configs import RTCAttentionSchedule
+        except ImportError:
+            from lerobot.configs.types import RTCAttentionSchedule
         from lerobot.configs.policies import PreTrainedConfig
-        from lerobot.policies import get_policy_class, make_pre_post_processors
-        from lerobot.policies.rtc import RTCConfig
+        try:
+            from lerobot.policies import get_policy_class, make_pre_post_processors
+        except ImportError:
+            from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+        try:
+            from lerobot.policies.rtc import RTCConfig
+        except ImportError:
+            from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
         self.torch = torch
         self.device = torch.device(device)
@@ -191,6 +201,8 @@ class LeRobotDiTPolicy:
     def _prepare(self, obs: dict):
         from lerobot.policies.utils import prepare_observation_for_inference
 
+        from robokit.comm import decode_image_maybe_jpeg
+
         if self.camera not in obs["images"]:
             raise RuntimeError(
                 f"Camera {self.camera!r} is absent; available={sorted(obs['images'])}"
@@ -219,7 +231,9 @@ class LeRobotDiTPolicy:
         instruction = self.instruction or obs.get("instruction") or ""
         if not instruction:
             raise RuntimeError("instruction is empty")
-        received = np.asarray(obs["images"][self.camera], dtype=np.uint8)
+        received = np.asarray(
+            decode_image_maybe_jpeg(obs["images"][self.camera]), dtype=np.uint8
+        )
         frame = {self.image_key: received, "observation.state": state}
         prepared = prepare_observation_for_inference(
             frame, self.device, task=instruction, robot_type="piper"

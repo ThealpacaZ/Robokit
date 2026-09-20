@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Event, Lock, Thread
 
 import numpy as np
 
@@ -49,7 +50,15 @@ def tensor_to_uint8(tensor) -> tuple[np.ndarray, tuple[float, float]]:
 
 
 class ObsView:
-    """显示 / 落盘部署链路上的图像。``every`` 控制抽样，避免拖慢控制频率。"""
+    """显示 / 落盘部署链路上的图像。``every`` 控制抽样，避免拖慢控制频率。
+
+    看图是诊断功能，**绝不允许占用控制线程的时间预算**：RTC 下调用方每多花 10ms
+    就少 0.3 步的推理余量，实测 imshow+waitKey 在 XWayland 上要 170-400ms，足以
+    把 d 顶出 s_min 触发 deadline abort。因此 ``images()`` 只把帧放进一个槽位就
+    返回，真正的 cvtColor/imwrite/imshow 全部在后台线程做；来不及显示的帧直接丢
+    弃（要的是「现在长什么样」，不是每帧都看到）。cv2 的 GUI 调用全部只发生在这
+    一个后台线程里。
+    """
 
     def __init__(self, show=False, save_dir=None, every=1, tag="obs"):
         self.show = bool(show)
@@ -59,11 +68,17 @@ class ObsView:
         self._cv2 = None
         self._windows = set()
         self._saved = 0
+        self._dropped = 0
+        self._slot = None
+        self._slot_lock = Lock()
+        self._wake = Event()
+        self._stop = Event()
+        self._worker = None
         if self.save_dir is not None:
             self.save_dir.mkdir(parents=True, exist_ok=True)
             log(self.tag, f"图像落盘 → {self.save_dir}（每 {self.every} 次一张）", "INFO")
         if self.show:
-            log(self.tag, f"图像实时显示：开（每 {self.every} 次一帧）", "INFO")
+            log(self.tag, f"图像实时显示：开（每 {self.every} 次一帧，后台线程）", "INFO")
 
     @property
     def enabled(self) -> bool:
@@ -80,25 +95,63 @@ class ObsView:
         return self.enabled and int(index) % self.every == 0
 
     def images(self, images: dict, index: int, kind="recv") -> None:
-        """处理一组 {相机名: RGB uint8 图}。"""
+        """处理一组 {相机名: RGB uint8 图}。调用方线程只做一次拷贝就返回。"""
         if not self._wants(index):
             return
-        cv2 = self._lazy_cv2()
+        frames = {}
         for name, image in images.items():
             frame = np.asarray(image)
             if frame.ndim != 3 or frame.shape[-1] != 3:
                 continue
-            bgr = cv2.cvtColor(frame.astype(np.uint8), cv2.COLOR_RGB2BGR)
+            # 拷贝：调用方（相机/观测字典）随时可能复用这块缓冲。
+            frames[name] = np.array(frame, dtype=np.uint8, copy=True)
+        if not frames:
+            return
+        self._ensure_worker()
+        with self._slot_lock:
+            if self._slot is not None:
+                self._dropped += 1
+            self._slot = (frames, int(index), str(kind))
+        self._wake.set()
+
+    def _ensure_worker(self) -> None:
+        if self._worker is None:
+            self._worker = Thread(target=self._pump, name=f"{self.tag}-view", daemon=True)
+            self._worker.start()
+
+    def _pump(self) -> None:
+        while not self._stop.is_set():
+            if not self._wake.wait(timeout=0.2):
+                # 没有新帧也要给 GUI 一次事件处理，否则窗口拖动/重绘会卡住。
+                self._drain_gui()
+                continue
+            self._wake.clear()
+            with self._slot_lock:
+                item, self._slot = self._slot, None
+            if item is None:
+                continue
+            try:
+                self._render(*item)
+            except Exception as exc:  # 看图绝不能打断控制循环
+                log(self.tag, f"显示失败：{type(exc).__name__}: {exc}", "WARNING")
+
+    def _render(self, frames: dict, index: int, kind: str) -> None:
+        cv2 = self._lazy_cv2()
+        for name, frame in frames.items():
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             if self.save_dir is not None:
-                path = self.save_dir / f"{kind}-{int(index):06d}-{name}.png"
+                path = self.save_dir / f"{kind}-{index:06d}-{name}.png"
                 cv2.imwrite(str(path), bgr)
                 self._saved += 1
             if self.show:
                 title = f"{kind}:{name}"
                 self._windows.add(title)
                 cv2.imshow(title, bgr)
-        if self.show:
-            cv2.waitKey(1)
+        self._drain_gui()
+
+    def _drain_gui(self) -> None:
+        if self.show and self._windows and self._cv2 is not None:
+            self._cv2.waitKey(1)
 
     def tensor(self, tensor, index: int, name="cam", kind="model") -> None:
         """处理一张预处理后的图像张量（真正进模型的那张）。"""
@@ -114,8 +167,15 @@ class ObsView:
         self.images({name: image}, index, kind=kind)
 
     def close(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._worker is not None:
+            self._worker.join(timeout=2.0)
+            self._worker = None
         if self.save_dir is not None and self._saved:
             log(self.tag, f"共落盘 {self._saved} 张图 → {self.save_dir}", "INFO")
+        if self._dropped:
+            log(self.tag, f"显示跟不上，丢弃 {self._dropped} 帧（不影响控制）", "INFO")
         if self._windows and self._cv2 is not None:
             try:
                 self._cv2.destroyAllWindows()

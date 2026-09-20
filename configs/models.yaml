@@ -9,6 +9,9 @@
 #
 # 加一个新模型 = 在 models: 下加一条记录，不需要改任何 Python 或 shell。
 
+# instruction 必须和训练时的 task 字符串**逐字**一致 —— 服务端把它直接当 task= 喂
+# tokenizer，对不上不会报错，只会静默降级。每个 pi05 记录都显式写死自己的那一条，
+# 不要依赖 defaults 里那个。查证方式：dataset 的 meta/tasks.parquet。
 defaults:
   camera: cam_high
   arm: right_arm
@@ -23,23 +26,75 @@ defaults:
     prefix_attention_schedule: EXP
 
 models:
-  # ── OpenVLA-OFT LoRA：401 段 StackCups、EEF delta ─────────────────────────
-  openvla-oft:
-    family: openvla_oft
-    checkpoint: /root/autodl-tmp/openvla_oft_deploy/stackcups-step-025000
+  # ── laMem-VLA v2：MemoryVLA(CogACT-Large) 全量微调，502 段两任务 EEF delta ─────
+  # HF quhongyu123/laMem-VLA 的 ckpointsv2.zip（2026-09-10 上传）→ step 25000 / 53 epoch，
+  # 训练 mix lememory_all = Stack_one_cup_b0(201) + Cover_the_building_block_b0/b1(301)。
+  # 跑在 westb 4090 机（ssh 别名 westb），checkpoint 只服务端读。
+  lamem-v2:
+    family: memoryvla
+    checkpoint: /root/autodl-tmp/models/laMem-VLA-v2/checkpoints/step-025000-epoch-53-loss=0.0156.pt
+    # RLDS 的 language_instruction 就是采集时的 task_name 原文（无 <control mode> 后缀）
+    instruction: "Stack one cup on top of another cup"
     action_space: eef_delta
-    chunk_size: 30
+    # future_action_window_size=15 → 每次预测 16 行
+    chunk_size: 16
     port: 8080
-    horizon: 30
-    min_execution_horizon: 15
+    # sync 每块执行前 10 步（2026-07 真机用的 action_chunking_window=10）
+    horizon: 10
+    min_execution_horizon: 8
+    policy_args:
+      codebase: /root/robokit/vendor/MemoryVLA-openvla-codebase
+      # 必须是 dataset_statistics.json 里的键；换任务要一起换：
+      #   Stack_one_cup_on_top_of_another_cup_b0
+      #   Cover_the_building_block_with_a_cup,_then_lift_up_the_cup_covering_the_block._b0 / _b1
+      unnorm_key: Stack_one_cup_on_top_of_another_cup_b0
+      preprocess: train_aligned
+      # 服务器离线：Llama-2 只要 config+tokenizer（本地目录），视觉骨干权重由 checkpoint 自带
+      llama_hf_path: /root/autodl-tmp/models/llama2-7b-hf-tokenizer
+      timm_pretrained: false
     notes: |
-      continuous L1 action head；每行是 7 维 local EEF delta + continuous gripper。
-      当前服务只支持 sync，不使用 RTC prefix guidance。
+      每行 = [local dx,dy,dz,droll,dpitch,dyaw, gripper]，米 / 真弧度 / xyz 外旋，
+      夹爪连续开度（mask=False，不反归一化、不二值化）。只支持 --mode sync；
+      RTC 的 prefix guidance 没有接到 MemoryVLA 的 DDIM 采样上。
+      另一任务的 instruction："Cover the building block with a cup, then lift up the
+      cup covering the block."（真机端 -L 逐字覆盖，并把 unnorm_key 换成对应键）。
+
+  # ── 同一份 laMem-VLA v2 权重，切到"杯子盖积木"任务 ─────────────────────────
+  # 和 lamem-v2 只差 instruction 与反归一化键；同占 8080（33 GB 显存，两个 MemoryVLA
+  # 进程放不下 48 GB 卡），所以是二选一：serve_ctl.sh stop lamem-v2 sync 再 start 这个。
+  lamem-v2-cover:
+    family: memoryvla
+    checkpoint: /root/autodl-tmp/models/laMem-VLA-v2/checkpoints/step-025000-epoch-53-loss=0.0156.pt
+    instruction: "Cover the building block with a cup, then lift up the cup covering the block."
+    action_space: eef_delta
+    chunk_size: 16
+    port: 8080
+    horizon: 10
+    min_execution_horizon: 8
+    policy_args:
+      codebase: /root/robokit/vendor/MemoryVLA-openvla-codebase
+      # 该任务两个批次 _b0(157 段)/_b1(144 段) 统计量几乎相同，取段数多的 _b0
+      unnorm_key: "Cover_the_building_block_with_a_cup,_then_lift_up_the_cup_covering_the_block._b0"
+      preprocess: train_aligned
+      llama_hf_path: /root/autodl-tmp/models/llama2-7b-hf-tokenizer
+      timm_pretrained: false
+    notes: |
+      与 lamem-v2 同权重、同契约（EEF delta + 连续夹爪，仅 sync）。
+
+  # ── OpenVLA-OFT LoRA：401 段 StackCups、局部系 EEF delta（2026-08，已失效）──
+  # 2026-09-16 删除：checkpoint 所在的旧 westb 实例已释放，HF 仓库
+  # shaohuan1/stackcups_openvla_oft_lora 也已不存在（404），权重无处可取；
+  # 且它没有 policy_args（base/codebase/unnorm_key），与当前适配器签名不兼容。
+  # 要复现这一轮就重训，配方在 openvla_oft_remote/training_config.json。
+  # 当前可用的 OFT 条目是下面的 openvla-oft-alltask。
 
   # ── PI0.5 全量微调：EEF delta 数据训练 ────────────────────────────────────
+  # 201 段 Stack-one-cup，step 30000（29.1 epoch）。旧的 400 段 checkpoint 已从
+  # 服务器删除，这里换成 HF shaohuan1/..._eef_pi05_full_step30000 下回来的那份。
   pi05-eef:
     family: pi05
-    checkpoint: /root/autodl-tmp/models/full_finetunes/stackcups_202_400_eef_pi05_last
+    checkpoint: /root/autodl-tmp/models/keep/eef_step030000
+    instruction: "Stack one cup on top of another cup <control mode> eef <control mode>"
     action_space: eef_delta
     chunk_size: 50
     port: 8080
@@ -56,10 +111,116 @@ models:
       10.12mm 并累积撞上 workspace 边界，同 checkpoint 的 sync 完成 180/180 且
       0 违规。要跑 RTC 请优先用 pi05-joint。
 
+  # ── OpenVLA-OFT LoRA：仓库全部 8 任务，**基座系** EEF delta ────────────────
+  # 2026-09-16 在 westb2（RTX PRO 6000 98G）训的 oft_alltask_eefbase_lora：
+  # 54,000 步 / 24 小时 / batch 16，数据是 RLDS 1.3.0 的 robokit_eefbase_*
+  # （1939 段，近两天批次已在盘上复制 3 份）。只支持 --mode sync。
+  #
+  # action_space=eef_delta_base 与 pi05-eef 的 eef_delta 是**两套不同契约**：
+  # 前者 Δp 直接相加、ΔR 左乘（OXE/OpenVLA 约定），后者增量在上一帧 EEF 局部系。
+  # 喂错不会报错，只会整体走偏，执行器按这个字段选 apply 函数。
+  openvla-oft-alltask:
+    family: openvla_oft
+    checkpoint: /root/autodl-tmp/openvla_oft_runs/oft_alltask_eefbase_lora
+    instruction: "Press and hold the red and blue buttons in sequence for a while"
+    action_space: eef_delta_base
+    chunk_size: 30
+    port: 8080
+    horizon: 30
+    min_execution_horizon: 15
+    policy_args:
+      base: /root/autodl-tmp/hf/hub/models--openvla--openvla-7b/snapshots/47a0ec7fc4ec123775a391911046cf33cf9ed83f
+      codebase: /root/autodl-tmp/openvla-oft
+      # 反归一化尺度按任务分开存的；换任务除了换 -L，还要用 --unnorm-key 换这个
+      unnorm_key: robokit_eefbase_press_and_hold_the_red_and_blue_buttons_in_sequence_for_a_while
+    notes: |
+      prompt 不带 " <control mode> ..." 后缀：OFT 的数据集里 language_instruction
+      就是任务原文（与 pi0.5 那套不同，别混抄）。
+      每行 = [dx,dy,dz,droll,dpitch,dyaw, next_gripper]，基座系、米 / 真弧度 / xyz 外旋。
+      换任务时 --unnorm-key 取 dataset_statistics.json 里对应的键，前缀
+      robokit_eefbase_ 加任务 slug；Cover 任务有 b0/b1/b2/b3 四个批次的键，取段数最多的 b0。
+
+  # ── PI0.5 全量微调：仓库全部 8 任务 JOINT，从 5 任务 step-006000 续训 ────────
+  # 2026-09-16 起在 westd2 训的 memoryvla_alltask_joint_pi05_from5task6k
+  # （1939 段 / 650,372 帧，单卡 batch 32，20k 步 ≈ 1 epoch）。checkpoint 路径指向
+  # 训练目录里的滚动存档，换 step 只改这一行；janitor 只留最新一份，钉住的在 models/keep/。
+  # 注意 westd2 的 1 号卡显存 34.5 GiB 以上是坏的，推理只占约 10 GB 放在 1 号卡安全，
+  # 且不跟 0 号卡上的训练抢显存：起服务时 CUDA_VISIBLE_DEVICES=1。
+  pi05-joint-alltask:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/keep/joint_step020000
+    instruction: "Press and hold the red and blue buttons in sequence for a while <control mode> joint <control mode>"
+    action_space: joint
+    chunk_size: 50
+    port: 8081
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    notes: |
+      每行 = [j1..j6, gripper]，六轴是下一帧**绝对**目标角（真弧度），不进 IK；
+      绝对关节目标满足 RTC 的 prefix guidance 假设，sync / rtc 都可用。
+      其余 7 条 prompt（末尾都带 " <control mode> joint <control mode>"，真机端 -L 逐字覆盖）：
+      Cover the building block with a cup, then lift up the cup covering the block.
+      Open the drawer, put the fruit and the cup from the table inside, and close the drawer.
+      Put the three items on the table into the drawer, then close the drawer.
+      Stack one cup on top of another cup
+      Place the banana, kiwi, and wax apple into the basket in that order.
+      Place the banana, mangoe, and grape into the basket in that order.
+      Place the banana, kiwi, and cherry into the basket in that order.
+
+  # ── PI0.5 全量微调：仓库全部 8 任务 EEF delta，近两天数据 3 倍采样 ──────────
+  # 2026-09-14 起在 westd 双 4090 训的 memoryvla_alltask_eef_pi05_full_recentx3
+  # （1708 段训练，batch 48，36k 步 ≈ 3 epoch），HF 同名仓库按 step-XXXXXX/ 发布。
+  # 8 条 prompt 见训练机 meta/tasks.parquet；真机跑非默认任务必须 -L 逐字覆盖。
+  pi05-eef-alltask:
+    family: pi05
+    # westd 训练机上就是硬链接钉住的那份（keep/eef_stepNNNNNN）；别的机器从 HF 下到
+    # /root/autodl-tmp/models/memoryvla_alltask_eef_pi05_full_recentx3/step-NNNNNN 后改这里。
+    # 2026-09-15 选 6000：已保留的 checkpoint 里 held-out eval_loss 最低（0.1265；
+    # 全局最低点是 step 3000 的 0.1234，但那份没保留）。
+    checkpoint: /root/autodl-tmp/models/keep/eef_step006000
+    instruction: "Press and hold the red and blue buttons in sequence for a while <control mode> eef <control mode>"
+    action_space: eef_delta
+    chunk_size: 50
+    port: 8080
+    horizon: 30
+    min_execution_horizon: 25
+    notes: |
+      其余 prompt（末尾都带 " <control mode> eef <control mode>"）：
+      Cover the building block with a cup, then lift up the cup covering the block.
+      Open the drawer, put the fruit and the cup from the table inside, and close the drawer.
+      Put the three items on the table into the drawer, then close the drawer.
+      Stack one cup on top of another cup
+      Place the banana, kiwi, and wax apple into the basket in that order.
+      Place the banana, mangoe, and grape into the basket in that order.
+      Place the banana, kiwi, and cherry into the basket in that order.
+      EEF delta 契约与 pi05-eef 相同；RTC 在该契约上的理论问题见 pi05-eef 的 notes。
+
+  # ── 同一个 EEF run 的 step 5000，held-out eval_loss 最低的那个 ────────────
+  # 0.2071 @ 4.85 epoch，HF 上的 commit message 标的是 "best eval_loss"。
+  # 但按 README 里那段，eval_loss 在这套数据上不是策略质量指标，"best" 只是这个
+  # 指标的最低点，不等于真机最好 —— 起它就是为了和 step 30000 直接比一次。
+  pi05-eef-5000:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/keep/eef_step005000
+    instruction: "Stack one cup on top of another cup <control mode> eef <control mode>"
+    action_space: eef_delta
+    chunk_size: 50
+    port: 8082
+    horizon: 30
+    min_execution_horizon: 25
+    notes: |
+      与 pi05-eef 同 run、同数据、同动作契约，只差训练步数（5000 vs 30000）。
+      RTC 对局部 SE(3) delta 的理论问题同样适用，见 pi05-eef 的备注。
+
   # ── PI0.5 全量微调：关节角数据训练 ────────────────────────────────────────
+  # 201 段 Stack-one-cup，step 15000（14.5 epoch）。训练仍在跑到 30000，
+  # pi0.5/pin_checkpoints.sh 会把 20000/25000/30000 也钉进 models/keep/，
+  # 换 checkpoint 只需改这一行的路径。
   pi05-joint:
     family: pi05
-    checkpoint: /root/autodl-tmp/models/full_finetunes/stackcups_150_400_joint_pi05_full
+    checkpoint: /root/autodl-tmp/models/keep/joint_step015000
+    instruction: "Stack one cup on top of another cup <control mode> joint <control mode>"
     action_space: joint
     chunk_size: 50
     port: 8081
@@ -70,3 +231,80 @@ models:
     notes: |
       绝对关节目标正是 RTC prefix guidance 假设的「可跨 chunk 对齐的轨迹坐标」，
       因此 RTC 在这个模型上语义成立。
+
+  # ── 同一个 run 的 step 2500，专门用来做真机对照 ───────────────────────────
+  # 这是 held-out eval_loss 最低的那个 checkpoint（0.1467 @ 2.42 epoch）。
+  # eval_loss 在这套数据上随 epoch 单调上升，它不是策略质量指标（见 README），
+  # 所以「eval_loss 最低」和「真机最好」是两回事，需要实机比一次才知道。
+  # 单独占一个端口，可以和 pi05-joint 同时起着来回切。
+  pi05-joint-2500:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/stack_one_cup_201_joint_pi05_full
+    instruction: "Stack one cup on top of another cup <control mode> joint <control mode>"
+    action_space: joint
+    chunk_size: 50
+    port: 8082
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    notes: |
+      和 pi05-joint 是同一个 run、同一份数据、同一个动作契约，只差训练步数。
+      默认不起，只有做 checkpoint 对照时才起。
+
+  # ── 同一个 run 的 step 12500，对照曲线的中段 ──────────────────────────────
+  # 本来想留 step 10000（9.7 epoch），但它已经被 checkpoint_janitor 的
+  # --max-retained 1 删掉且不可恢复；12500 是 12.1 epoch，在 eval_loss 曲线上
+  # 和 10000 几乎同一点（0.2576 vs 0.2924），用它顶替。
+  pi05-joint-12500:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/keep/joint_step012500
+    instruction: "Stack one cup on top of another cup <control mode> joint <control mode>"
+    action_space: joint
+    chunk_size: 50
+    port: 8083
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    notes: |
+      同 run 中段 checkpoint，只在做 2500 / 12500 / 15000 三点对照时才起。
+
+  # ── PI0.5 全量微调：5 任务联合、关节角（memoryvla 系列）─────────────────────
+  # HF shaohuan1/memoryvla_5task_joint_pi05_full；训练 7500 步 bs128，服务器上有
+  # step-006000（默认）与 step-001500 两个 checkpoint。
+  # 数据集 repo（memoryvla_5task_joint_pi05_lerobot）未上传 HF，5 条 task 字符串
+  # 以训练机 meta/tasks.parquet 为准 —— 多任务模型，instruction 必须在真机端用
+  # --instruction 逐字指定（此处 default 仅占位，喂错只会静默降级不报错）。
+  memvla-5task:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/memoryvla_5task_joint_pi05_full/step-006000
+    # 默认 drawer 任务;其余 4 条见 notes,真机跑非默认任务必须 --instruction 逐字覆盖
+    instruction: "Open the drawer, put the fruit and the cup from the table inside, and close the drawer. <control mode> joint <control mode>"
+    action_space: joint
+    chunk_size: 50
+    port: 8084
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    notes: |
+      绝对关节目标（同 pi05-joint 契约），RTC 语义成立。5 任务联合模型，
+      任务串 = 源仓 task_name + " <control mode> joint <control mode>"（2026-08-14
+      从 shaohuan1/Memoryvla 各 source_meta/config.json 核出，注意 mangoe 是训练
+      时的原始拼写，不能改）：
+      1. Open the drawer, put the fruit and the cup from the table inside, and close the drawer. <control mode> joint <control mode>
+      2. Place the banana, kiwi, and cherry into the basket in that order. <control mode> joint <control mode>
+      3. Place the banana, kiwi, and wax apple into the basket in that order. <control mode> joint <control mode>
+      4. Place the banana, mangoe, and grape into the basket in that order. <control mode> joint <control mode>
+      5. Stack one cup on top of another cup <control mode> joint <control mode>
+
+  memvla-5task-1500:
+    family: pi05
+    checkpoint: /root/autodl-tmp/models/memoryvla_5task_joint_pi05_full/step-001500
+    instruction: "OVERRIDE ME WITH --instruction"
+    action_space: joint
+    chunk_size: 50
+    port: 8085
+    horizon: 15
+    min_execution_horizon: 15
+    robot_config: configs/piper_single_joint.yaml
+    notes: |
+      同 run 早期 checkpoint（step 1500），只做对照时才起。

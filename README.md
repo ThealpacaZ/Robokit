@@ -1,41 +1,30 @@
 # robokit
 
-> **SSH / TUN 约定：本机长期保持 Mihomo TUN 开启。** 当前代理节点连接 SeetaCloud
-> 会在 SSH banner 前关闭或超时；普通进程走物理网卡直连又会被本地网络过滤。已验证可用路径是：
-> 临时把 Mihomo `GLOBAL` 选择器切到其内部 `DIRECT`，再经本地 SOCKS 端口建立 SSH；
-> SSH 退出后恢复原选择器。可在当前 shell 定义以下包装函数：
+> **SSH / TUN 约定（2026-08-05 修订）：本机长期保持 Mihomo TUN 开启，不要求关闭。**
+> 当前代理节点连接 SeetaCloud 会在 SSH banner 前关闭或超时；普通进程走物理网卡直连
+> 又会被本地网络过滤。可用路径是 Mihomo 的专用直连 SOCKS 入口 **`127.0.0.1:7899`**
+> （`proxy: DIRECT` 的独立 socks listener，不受 mode 和 `GLOBAL` 影响），
+> 一条命令即可，**无需任何前后处理**：
 >
 > ```bash
-> seeta_via_tun() (
->   set -e
->   local mihomo_socket=/tmp/verge/verge-mihomo.sock
->   local previous_global restore_payload
->   previous_global=$(curl -fsS --unix-socket "$mihomo_socket" \
->     http://localhost/proxies/GLOBAL | \
->     python3 -c 'import json,sys; print(json.load(sys.stdin)["now"])')
->   restore_global() {
->     restore_payload=$(MIHOMO_NODE="$previous_global" python3 -c \
->       'import json,os; print(json.dumps({"name": os.environ["MIHOMO_NODE"]}, ensure_ascii=False))')
->     curl -fsS --unix-socket "$mihomo_socket" -X PUT \
->       -H 'Content-Type: application/json' --data "$restore_payload" \
->       http://localhost/proxies/GLOBAL >/dev/null
->   }
->   trap restore_global EXIT INT TERM
->   curl -fsS --unix-socket "$mihomo_socket" -X PUT \
->     -H 'Content-Type: application/json' --data '{"name":"DIRECT"}' \
->     http://localhost/proxies/GLOBAL >/dev/null
->   "$@"
-> )
->
-> seeta_via_tun ssh \
->   -o 'ProxyCommand=nc -X 5 -x 127.0.0.1:7897 %h %p' \
->   -p "$SSH_PORT" root@connect.weste.seetacloud.com
+> ssh -o 'ProxyCommand=nc -X 5 -x 127.0.0.1:7899 %h %p' \
+>     -p "$SSH_PORT" root@connect.weste.seetacloud.com
 > ```
 >
-> 自动化时把最后的 `ssh ...` 改为 `sshpass -p "$SSH_PASSWORD" ssh ...`。端口和当日密码以
-> [PROJECT_MEMORY.md](PROJECT_MEMORY.md) 顶部为准。`seeta_via_tun` 在子 shell 中运行，正常退出、
-> 报错或中断都会恢复原节点；无需关闭 TUN，也不要添加永久系统路由。若仍在 banner 前失败，
-> 再检查实例状态和 SSH 映射端口，此时密码尚未参与认证。
+> 自动化时换成 `sshpass -p "$SSH_PASSWORD" ssh ...`，其余不变。端口和当日密码以
+> [PROJECT_MEMORY.md](PROJECT_MEMORY.md) 的 `ssh:` 行为准。
+>
+> ⚠️ **严禁**再用「临时把 `GLOBAL` 切成 `DIRECT`、用完恢复」的老办法（旧函数名
+> `seeta_via_tun`，2026-08-05 已从本文件删除）：本机是 `mode: global`，`GLOBAL` 是整机
+> 唯一出口开关，翻它会把 codex / Claude Code 自身一并拽下代理，两个任务重叠时后启动的
+> 那个会把 `DIRECT` 当成"原值"存下再写回，导致代理**永久粘在直连**。且 2026-08-05 复核：
+> `GLOBAL` 组已由 `profiles/Script.js` 重定义为**不含 `DIRECT`/`REJECT`**，那个 PUT 现在
+> 会被 mihomo 直接拒绝。详见 [PROJECT_MEMORY.md](PROJECT_MEMORY.md) 的「固定网络约定」。
+>
+> 判连通性**一律以读到 banner 为准**：`(sleep 8) | nc -X 5 -x 127.0.0.1:7899 <host> <port>`
+> 能读到 `SSH-2.0-OpenSSH_...` 才算通。TUN 的 gvisor 栈会对任意端口伪造 SYN-ACK，
+> `nc -vz` 的 "connect succeeded" 无意义；用 `</dev/null` 则会在 banner 到达前退出。
+> 若仍在 banner 前失败，再检查实例状态和 SSH 映射端口，此时密码尚未参与认证。
 
 Piper 机械臂的 VLA 真机工具包。两件事：
 
@@ -334,8 +323,37 @@ python pi0.5/convert_hdf5_to_lerobot.py \
 
 ## 功能二：执行推理
 
-服务端（GPU）+ 客户端（接机械臂），TCP 通讯。远程 GPU 先开隧道
-`ssh -N -L 8080:127.0.0.1:8080 -p <SSH端口> <用户>@<服务器>`（关节模型是 8081）。
+服务端（GPU）+ 客户端（接机械臂），TCP 通讯。机器人端先起隧道守护（断线自动重连）：
+
+```bash
+export ROBOKIT_SSH_PASS=...            # 不设则交互式输密码
+bash scripts/tunnel_ctl.sh start       # 8080/8081/8082 一起转发
+bash scripts/tunnel_ctl.sh status
+```
+
+**不要用裸 `ssh -N -L`**：这条链路经代理，掉线不算罕见，而裸 ssh 掉了不会自己回来，
+端口就此消失；真机端只有在下一次请求时才发现，表现为跑到一半
+`ConnectionRefusedError` 中止。守护脚本掉线后 3 秒重连。
+
+服务端起停用 `scripts/serve_ctl.sh`（带 pidfile；**不要用 `pkill -f`** —— 通过 ssh
+下发的远端命令行本身就含有模型名和 `serve_policy.py`，任何 `-f` 模式都会匹配到发起
+命令的那个 shell 自己，一 kill 就把自己杀了，这个坑今天踩了三次）：
+
+```bash
+bash scripts/serve_ctl.sh start pi05-joint rtc     # 起
+bash scripts/serve_ctl.sh status                   # 看谁在跑 + 哪些端口在听
+bash scripts/serve_ctl.sh log   pi05-joint rtc 40  # 看日志
+bash scripts/serve_ctl.sh stop  pi05-joint rtc     # 停
+```
+
+服务起来了不等于服务是对的。接臂之前先跑一次不需要硬件的 model-in-the-loop 自检，
+它用数据集里一帧 held-out 观测走完全相同的 TCP 协议，逐条验证 `server_mode`、
+`action_space`、chunk 形状、有限性、ΠGDM 引导是否真的触发、以及论文的时限不等式
+`d <= s_min <= H-d`：
+
+```bash
+python scripts/probe_policy_server.py --model pi05-joint --mode rtc
+```
 
 一共只有两个入口，两端都用 `--model` 选权重：
 
@@ -348,9 +366,84 @@ python pi0.5/convert_hdf5_to_lerobot.py \
 
 ```bash
 python scripts/run_policy.py --list
-# pi05-eef     PI0.5 全量微调，EEF delta 数据训练，端口 8080
-# pi05-joint   PI0.5 全量微调，关节角数据训练，端口 8081
+# openvla-oft        OpenVLA-OFT LoRA，EEF delta，端口 8080
+# pi05-eef           PI0.5 全量微调，EEF delta 数据训练，端口 8080
+# pi05-joint         PI0.5 全量微调，关节角数据训练，端口 8081
+# pi05-joint-2500    同一个 run 的 step 2500，做 checkpoint 对照用，端口 8082
+# lamem-v2          MemoryVLA 全量权重（laMem-VLA v2），EEF delta，端口 8080，仅 sync
 ```
+
+#### laMem-VLA v2（MemoryVLA 全量权重，2026-09-11 起在 westb 4090 机）
+
+`--model lamem-v2` 是 HF `quhongyu123/laMem-VLA` 的 `ckpointsv2.zip`（step 25000 /
+53 epoch，训练 mix = Stack_one_cup_b0 201 段 + Cover_the_building_block_b0/b1 301 段），
+EEF delta + 连续夹爪，每次预测 16 行，**只支持 `--mode sync`**。服务端 GPU 机是
+westb 的 4090（48 GB），ssh 别名 `westb`（`~/.ssh/config`，必须走本机 socks 7899；
+直连在 kex 阶段就被断）。适配器在 `robokit/policies/memoryvla.py`，MemoryVLA 代码库
+vendor 在 `vendor/MemoryVLA-openvla-codebase`，随 `scripts/sync_server.sh push` 一起推。
+
+```bash
+# 服务端（westb）
+bash scripts/serve_ctl.sh start lamem-v2 sync
+python scripts/smoke_memoryvla.py --model lamem-v2 --frames /root/autodl-tmp/frames_stackcups.npz   # 不经 TCP
+
+# 机器人端
+bash scripts/tunnel_ctl.sh start
+python scripts/probe_policy_server.py --model lamem-v2 --mode sync --hdf5 <某段>.hdf5   # 不接臂、不需要 lerobot
+python scripts/run_policy.py --model lamem-v2 --mode sync --dry-run
+python scripts/run_policy.py --model lamem-v2 --mode sync
+```
+
+两个任务的 instruction 是 RLDS 里的 `language_instruction` 原文（没有 `<control mode>`
+后缀）；换任务除了 `-L` 还要把登记表 `policy_args.unnorm_key` 换成对应的
+dataset_statistics 键（`Stack_one_cup_on_top_of_another_cup_b0` /
+`Cover_the_building_block_..._b0` / `_b1`），那是动作反归一化的尺度，不是提示词。
+
+`memvla-5task`（π0.5 五任务 joint，端口 8084）也起在 westb：`bash scripts/serve_ctl.sh start memvla-5task sync`，
+脚本按模型名自动选 `/root/autodl-tmp/envs/pi05` 的 python（`lamem-*` 才用 memvla 环境）。
+
+#### 当前登记的 PI0.5 权重（2026-08-06）
+
+旧的 400 段 `models/full_finetunes/*` 已从服务器删除，登记表现在指向 201 段
+Stack-one-cup 这一轮：
+
+| `--model` | checkpoint | 训练量 | held-out eval_loss |
+|---|---|---|---|
+| `pi05-eef` | `models/keep/eef_step030000` | step 30000 / 29.1 epoch | 0.5508 |
+| `pi05-joint` | `models/keep/joint_step015000` | step 15000 / 14.5 epoch | 0.3358 |
+| `pi05-joint-2500` | `models/stack_one_cup_201_joint_pi05_full` | step 2500 / 2.4 epoch | 0.1467 |
+
+**`instruction` 必须逐字等于训练时的 task 字符串**，登记表里每条都写死了自己的那一条：
+
+```
+Stack one cup on top of another cup <control mode> joint <control mode>
+Stack one cup on top of another cup <control mode> eef  <control mode>
+```
+
+服务端把它直接当 `task=` 喂 tokenizer，对不上不报错、只静默降级。查证方式是读数据集的
+`meta/tasks.parquet`，不要凭记忆填。
+
+**换指令用 `-L`**（`--L` / `--instruction` 是同一个开关），三个入口都认：
+
+```bash
+python scripts/run_policy.py --model pi05-joint -L "Stack one cup on top of another cup"
+python scripts/probe_policy_server.py --model pi05-joint -L "..."   # 不接臂先试
+python scripts/serve_policy.py --model pi05-joint -L "..."          # 钉死在服务端
+```
+
+指令**每帧随请求发**，服务端默认不钉死：客户端 `-L` 说了什么就用什么，改指令不必重启
+服务端（重连才算新 episode，policy 记忆按连接清）。只有在服务端也显式给了
+`--instruction/-L` 时它才反过来覆盖客户端那条——服务端启动日志会写明是哪种。
+客户端给的指令和登记表不一致时会打一条 WARNING，因为 VLA 的动作完全由语言条件决定。
+
+**不要按 eval_loss 挑 checkpoint。** 这套数据上 eval_loss 从第一个测量点起就随 epoch
+单调上升（1 epoch 0.104 → 14.5 epoch 0.336），而 201 段和 400 段两个数据集的曲线按
+epoch 完全重合——数据翻倍收益为零，所以不是数据量不足的过拟合。pi0.5 的 loss 是
+flow-matching MSE，它的最优解是动作块的**条件均值**，模型越锐、越敢承诺单一模态，
+对着单条 GT 算出来的 MSE 反而越大。`pi05-joint-2500` 就是 eval_loss 最低的那个
+checkpoint，单独占一个端口，是为了在真机上和 `pi05-joint` 直接比一次——这两件事的
+结论目前还不能互相推导。离线对照用 `pi0.5/eval_checkpoint_ab.py`（完整去噪采样后比
+物理单位误差，而不是比 flow-matching loss）。
 
 ### 启动命令
 
@@ -361,8 +454,9 @@ cd /root/robokit
   --model pi05-joint --mode rtc          # 或 --mode sync
 
 # ── 机器人端 1) 复位到示教起点 ─────────────────────────────────────────────
-python scripts/reset_piper_to_demo_start.py \
-  --dataset "datasets/stack cups" --episode 0 --port can0 \
+# 起点是写死的固定关节角（stack cups 首帧），不读数据集、本机不用存 HDF5。
+# 要用别的起点再加 --dataset <目录> --episode N，逻辑不变。
+python scripts/reset_piper_to_demo_start.py --port can0 \
   --execute --skip-controller-reset
 
 # ── 机器人端 2) 第一次先做零运动检查 ───────────────────────────────────────
@@ -375,8 +469,10 @@ python scripts/run_policy.py --model pi05-joint --mode rtc
 
 第 1 步只在**开机第一次**需要手工跑：之后按回车中断执行，`run_policy.py` 会在会话完全
 退出（归位、controller reset、CAN 释放）之后自动执行同一条复位命令，把臂送回示教起点。
-数据集目录和 CAN 口默认从机器人配置推出（`collect.save_path`/`task_name`、第一条 Piper
-臂的 `port`），可用 `--reset-dataset` / `--reset-episode` / `--reset-port` 覆盖，
+复位目标是 `reset_piper_to_demo_start.py` 里写死的固定关节角
+`[-82.156, 0.246, -0.149, 15.031, 12.848, -11.688]°`，**不读数据集**；CAN 口从机器人
+配置里第一条 Piper 臂的 `port` 推出。要改成从真实 HDF5 选起点就加
+`--reset-dataset` / `--reset-episode`，`--reset-port` 覆盖 CAN 口，
 `--no-reset-on-interrupt` 关掉。只有回车中断会触发它：`Ctrl-C` 与安全中止不复位，那两种
 情况现场需要先被人看一眼。
 
@@ -450,11 +546,23 @@ preprocessor 的归一化已生效）。PI0/PI0.5 的 resize 在模型 forward �
 `model-*.png` 的分辨率通常仍等于收到的帧 —— 它回答的是「送进模型的像素内容对不对」
 （视角、亮度、送错相机、图被裁掉），不是「模型内部最后那层 224×224 长什么样」。
 
+### 拍一张现场照片
+
+```bash
+python scripts/snapshot.py                          # 配置里全部相机，各存一张到 runs/snapshots/
+python scripts/snapshot.py --camera cam_high --warmup 240 --out runs/snapshots/scene-a
+```
+
+只开相机不碰机械臂/CAN，取帧走 collect / run_policy 同一条路径，文件名
+`YYYYmmdd-HHMMSS-<camera>.jpg`，路径打在最后一行。相机被 run_policy / collect 占着时
+会用中文说明并以退出码 2 结束。**不要套 `timeout` 或用 `kill -9`**：RealSense 没走
+`pipeline.stop()` 就被杀过一次，把 USB 控制器搞死了；Ctrl-C 是安全的，脚本会先关相机再退。
+
 ### 其他常用开关
 
 ```bash
 --dry-run                 # 不下发运动帧，只跑链路与检查。上真机的第一次跑用它
---instruction "stack cups"  # 覆盖登记表里的语言指令
+-L "stack cups"           # 覆盖登记表里的语言指令（= --L = --instruction）
 --host / --port           # 覆盖服务器地址与端口
 --chunk-base recursive|continuous|feedback   # 递推基准，缺省 sync=recursive、rtc=continuous
 --control-freq 20         # 降频；比减小 horizon（丢弃模型预测的后续步）更可取
@@ -463,35 +571,11 @@ preprocessor 的归一化已生效）。PI0/PI0.5 的 resize 在模型 forward �
 --trace runs/deploy/xxx.jsonl                # 缺省自动写 runs/deploy-<mode>/
 ```
 
-MemoryVLA 等非 DiT 权重仍走旧的通用服务端：
+联调不想加载模型时用 `--policy dummy`（回发当前状态）：
 
 ```bash
-python scripts/deploy_server.py --port 8080 --policy memvla_lora \
-    --policy-arg checkpoint=/path/to/step-010000.pt \
-    --policy-arg base=/path/to/CogACT-Large.pt \
-    --policy-arg codebase=/path/to/MemoryVLA-openvla-codebase
-# 联调用 --policy dummy（回发当前状态，不需要模型）
+python scripts/deploy_server.py --port 8080 --policy dummy
 ```
-
-OpenVLA-OFT 的 latest-only LoRA + continuous action head 也走这个通用同步服务端。当前冻结的
-StackCups step 25,000 权重严格使用以下命令：
-
-```bash
-# GPU 服务器
-cd /root/robokit
-/root/autodl-tmp/envs/openvla_oft/bin/python scripts/deploy_server.py \
-  --port 8080 --action-space eef_delta --policy openvla_oft \
-  --policy-arg checkpoint=/root/autodl-tmp/openvla_oft_deploy/stackcups-step-025000 \
-  --policy-arg base=/root/autodl-tmp/openvla-7b-oft-base \
-  --policy-arg codebase=/root/autodl-tmp/openvla-oft \
-  --policy-arg robot_platform=piper
-
-# 机器人端：先建立 README 顶部所述 TUN SSH 隧道，再直接运行真机同步控制
-python scripts/run_policy.py --model openvla-oft --mode sync
-```
-
-该 checkpoint 的动作契约是单 `cam_high`、`(30,7)` local EEF delta + continuous gripper；
-只允许 `sync`，不要为它使用 `--mode rtc`。
 
 ### 数字孪生：`piper_data_reviewer`
 
@@ -674,87 +758,6 @@ Pinocchio 3.6.0 是机器人端环境的显式依赖；已有环境更新：
 conda install -n robokit -c conda-forge pinocchio=3.6.0 "numpy<2"
 ```
 
-### π0 关节角训练与执行（训练 50/30，当前运行 chunk=15、30Hz）
-
-这套对照使用 LeRobot `lerobot/pi0_base`，不是 MemoryVLA/PI0.5。源仍为 202 段
-`stack cups` HDF5，转换为独立的 `shaohuan1/stackcups_joint_pi0_lerobot`：
-
-- `observation.state = 当前 [j1..j6, gripper]`
-- `action = 下一帧绝对 [j1..j6, gripper]`
-- 六轴单位为弧度；`use_relative_actions=false`
-- checkpoint 训练配置保持 `chunk_size=50`、`n_action_steps=30`
-- 当前运行时服务只回传预测块前 15 行，客户端也只执行 15 行；不需要重训
-- LoRA r32/alpha32、batch 8、**30,000 step**、每 1000 step 保存/评估
-- 固定跑满 30k，不做早停；最终发布最后一个 `030000/pretrained_model`，不按 eval 选 best
-
-PI0 base 固定 revision `25c379b52ba2ff8788cab921758a3cc3fe3f77f2`；
-`prepare_pi0_base.sh` 用多连接下载后核对 14,005,618,584-byte
-`model.safetensors` 的 SHA-256
-`8229fd9a7c3c2aafc1e223567b61b5fe3e25eef873bb4233928dbee4bd836303`。
-旧误配 run（10k、执行 39）已归档，不得当作候选权重。当前正确 run：
-[stackcups_joint_pi0_h30 / i8tmjy90](https://wandb.ai/yangshaohuan720-university/stackcups_joint_pi0_h30/runs/i8tmjy90)。
-该 run 已固定跑满 30,000 step，完成标记为
-`/root/autodl-tmp/outputs/stackcups_joint_pi0_h30/COMPLETED`；最终 checkpoint 配置回读为
-π0、`chunk_size=50`、`n_action_steps=30`、`use_relative_actions=false`，发布的是最后
-一个 `030000`，不是 held-out eval best。
-
-服务器后台入口：
-
-```bash
-set -a
-source /root/autodl-tmp/secrets/pi05.env
-set +a
-export PATH=/root/autodl-tmp/envs/pi05/bin:$PATH
-export PYTHON_BIN=/root/autodl-tmp/envs/pi05/bin/python
-bash pi0/run_joint_training_server.sh
-```
-
-训练完成后在独立端口 8081 启动关节服务，避免与当前旧 EEF 服务的 8080 冲突：
-
-在 `configs/models.yaml` 里加一条 `family: pi0` 的记录（`action_space: joint`、
-`port: 8081`、`horizon: 15`），之后两端都只用 `--model` 指名，不再有第二套脚本：
-
-```bash
-# GPU 服务器
-python scripts/serve_policy.py --model pi0-joint --mode sync
-```
-
-关节配置 `control_freq_locked: true` 会拒绝任何不是 30Hz 的 `--control-freq` 覆盖：
-
-```bash
-# 先建立 ssh -L 8081:localhost:8081 ...，再做零运动检查
-python scripts/run_policy.py --model pi0-joint --dry-run --max-steps 15
-```
-
-确认 dry-run 的 `arm_command.joint_target_deg` 后，真机只跑一块：
-
-```bash
-python scripts/run_policy.py --model pi0-joint --max-steps 15 \
-  --trace runs/deploy/pi0-joint-real.jsonl
-```
-
-服务明确回报 `server_mode=sync`、`action_space=joint`；误连 EEF 服务会在执行器前失败。
-执行路径直接调用 `JointCtrl`，不会做 EEF 累加或 IK。第一次真机执行仍应先审查 dry-run
-的 `(15,7)` 输出，再以少轮数测试。
-
-2026-07-29 当前实例为远端 PID 586280、8081、`--horizon 15`，本机 SSH 隧道监听
-`127.0.0.1:8081`；旧 EEF 8080 同时保留。切换前 H=30 测试曾确认 π0 flow 采样有随机
-关节越界，处理方式见下方限位钳制。
-
-2026-07-29 用户决定这套 **joint 专用配置**关闭 ActionGuard，并把有限的 6-D 直接关节
-目标逐轴钳到最近机械限位后执行：`deploy.safety.enabled=false`、
-`joint_limit_mode=clip`。例如 j2=-1.2° / j3=0.9° 会成为 0° / 0°；
-dry-run 也走同一套纯软件量化/钳制路径，在 trace 的 `arm_command` 中同时记录
-`joint_requested_deg`、`joint_clipped_axes`、`joint_limit_clip_delta_deg` 和最终
-`joint_target_deg`，但不发 CAN。无需再传 `--no-guard`。该行为只作用于
-`configs/piper_single_joint.yaml` 的直接 joint 路径；EEF/IK 配置保持严格拒绝。
-错误维度、NaN/Inf、反馈/CAN/驱动器/控制器异常仍会硬中止。
-
-当前端到端证据 `runs/deploy/pi0-joint-h15-30hz-fixed-dry-run.jsonl`：服务返回
-`(15,7)`，15/15 行、0 abort、0 CAN；15 行的 j2/j3 均按配置钳制，最终六轴全部合法。
-绝对 deadline 调度实测平均间隔 33.395ms，即 29.944Hz；它会扣除每步软件处理耗时，
-而不是处理完成后再额外 sleep 33.333ms。非锁定的旧 EEF 配置保持历史调度行为。
-
 ### 安全闸
 
 `robokit/safety.py`，配置在 `deploy.safety`，下发前逐条检查，超限立即中止：
@@ -797,6 +800,52 @@ robokit HDF5
 - **不启用 LeRobot 的 relative action。** 转换出的 action 已经是局部 EEF 增量，再设
   `--policy.use_relative_actions=true` 会错误地从增量上再减一次 state。
 
+### MemoryVLA 大数据集下载与转换
+
+`shaohuan1/Memoryvla` 的五任务 joint 全量训练集（排除 `Cover_the_building_block...`）
+不是普通的十几 GB 数据集：2026-08-07 从 Hub tree 固定计划得到 **594 episodes、
+185.3 GB HDF5、12 个磁盘受限 chunk**。不要先把原始数据完整落盘；150 GB 数据盘同时还要
+容纳 PI0.5 base、LeRobot 派生数据和约 23 GB/份的 checkpoint。
+
+服务器上的稳定下载配置是先 `source /etc/network_turbo`，再让 `aria2c` 使用
+`-j3 -x8 -s8 -k10M --continue=true --file-allocation=none`。这里 `-j` 是并行文件数，
+`-x/-s` 是单文件连接数；连接越多并不一定越快。对相同未处理文件做 30 秒隔离测速时，
+`j4/x8` 约 4 MiB/s、`j3/x16` 约 12 MiB/s、`j6/x4` 约 21–23 MiB/s，而生产配置长时间
+运行在约 20–60 MiB/s、常见 35–45 MiB/s。学术代理会重置连接，批量下载必须接受非零
+aria2 pass、按缺失文件重跑；不要根据单文件的短时峰值继续堆连接。
+
+长度校验不够：aria2 多连接写入会让中断文件具有正确 apparent size，却在中间留下空洞。
+`prepare_memoryvla_multitask.py stage` 因此按 Hub LFS oid 对每个 HDF5 做完整 SHA-256，
+只把通过校验的文件 symlink 到转换目录，并用 `(size, mtime)` ledger 避免恢复时重复哈希。
+看实时落盘量用 `du -sh`/allocated blocks，不用 apparent size。
+
+`run_memoryvla_multitask_joint.sh` 使用每 chunk 独立的 raw/stage 目录做双缓冲：转换 chunk N
+时后台下载 chunk N+1，转换成功后只删除 N 的原始文件。下载和 SVT-AV1 编码分别占网络和
+CPU，重叠后总耗时由下载决定。状态目录里的 `chunkN.started`/`chunkN.done` 防止重复追加；
+重跑同一入口会跳过完成块并续传当前块。磁盘检查为下一块额外保留 40 GB headroom，任一时刻
+最多驻留两个原始 chunk。入口默认 `setsid + nohup` 脱离 SSH，启动方式为：
+
+```bash
+set -a
+source /root/autodl-tmp/secrets/pi05.env
+set +a
+bash /root/robokit/pi0.5/run_memoryvla_multitask_joint.sh
+```
+
+主日志在 `/root/autodl-tmp/state/memoryvla_5task_joint_pi05_full/pipeline.log`；下载与预取日志
+分别在 `/root/autodl-tmp/outputs/memoryvla_5task_joint_pi05_full.{download,prefetch}.log`。
+`pipeline.pid` 的进程必须是 PPID 1 且 SID 等于 PID，才算真正不依赖 SSH。
+
+单相机转换看起来不会占满所有 CPU，这是当前 LeRobot writer 的结构，不是
+`image_writer_threads` 太小：它逐 episode 编码，只有多相机才开 encoder process pool。
+SVT-AV1 v3 日志中的 `Level of Parallelism` 是 0–6 的级别，不是线程数；默认已经选到 6，
+把 LeRobot `encoder_threads` 设为 24 只会警告并钳回 6。preset 12 也已由当前库映射到最快的
+preset 10。要再利用剩余 CPU 必须改成多 episode 并行编码并串行提交 metadata；不能让多个
+进程直接 append 同一个 LeRobot dataset。当前转换与下载重叠后仍由网络限速，因此不要为几分钟
+编码收益冒数据集损坏风险。用实际 640×480/30 fps/969 帧成品做同帧转码：x264 ultrafast
+1.039 秒（933 fps）、当前 SVT-AV1 1.261 秒（769 fps）、NVENC p1 2.556 秒（379 fps）；
+短片上 x264 最快，但只领先实际 AV1 约 21%，说明整体转换时间主要不在视频 codec 本身。
+
 数据契约：
 
 | 字段 | 7 维含义 |
@@ -818,6 +867,7 @@ bytes HDF5、320×240 RGB、30 Hz、单 `right_arm` / `cam_high`、任务均为 
 | 文件 | 用途 |
 |---|---|
 | `prepare_lememory.py` | 只下载 HF 两批 stack-cups HDF5/元数据，核对 0..201 连续编号并合并清洗报告 |
+| `prepare_memoryvla_multitask.py` | 从 Hub tree 建五任务计划，分块续传、LFS SHA-256 校验并生成独立 staged view |
 | `convert_hdf5_to_lerobot.py` | 清洗硬闸、全量 HDF5 校验、单相机 LeRobot 转换和 HF 上传 |
 | `validate_lerobot.py` | 检查单图、7 维 state/action、quantile stats 和抽样有限值 |
 | `prefetch_hf.py` | 服务器预下载 Dataset、PI05 base 和 LoRA adapter 到 HF cache |
@@ -826,6 +876,7 @@ bytes HDF5、320×240 RGB、30 Hz、单 `right_arm` / `cam_high`、任务均为 
 | `monitor_convergence.py` | 读取 held-out eval loss；平台达到条件后等完整 checkpoint 落盘再终止 trainer |
 | `publish_checkpoint.py` | 把确认完整的 LoRA `pretrained_model` 发布到权重仓库根并回读验证 |
 | `run_training_server.sh` | HF 准备→转换/发布→训练→W&B→收敛发布→条件关机的服务端守护入口 |
+| `run_memoryvla_multitask_joint.sh` | 五任务 joint 全参数微调：双缓冲下载/转换→校验→batch smoke→训练/W&B→checkpoint 保全 |
 | `test_contract.py` | 验证 EEF 局部增量、RTC 切块/跳步/deadline 和服务端缓存契约 |
 | `requirements.txt` | 固定核对过的 LeRobot revision 和 PI05/PEFT 依赖 |
 
@@ -1120,6 +1171,31 @@ python scripts/run_policy.py \
 
 确认返回 `(N,7)`、相机亮度正常、安全闸没有持续拒绝、动作量级合理后才去掉
 `--dry-run`。动作契约的纯软件验证为 `python pi0.5/test_contract.py`。
+
+### 录 demo：`--demo` + 挑片工具
+
+`--demo` = 开相机录像（`--record-video` 那套：每台相机一个独立线程、全帧率写 mp4 +
+帧号 sidecar，不与控制循环同步）+ 在录像目录写一份 `rollout.json`（模型、指令、
+sync/rtc、horizon、结果、时长、trace 路径）。
+
+```bash
+python scripts/run_policy.py --model pi05-joint-alltask --mode sync --horizon 50 \
+  --demo -L "Stack one cup on top of another cup <control mode> joint <control mode>"
+```
+
+录 demo 免不了反复 rollout，满意的就一两条。挑片和清理用：
+
+```bash
+python scripts/demo_rollouts.py list                 # 每次的时间/任务/结果/时长/体积
+python scripts/demo_rollouts.py keep --last          # 刚那条不错 → 标记保留
+python scripts/demo_rollouts.py keep 20260916-091530-pi05-joint-alltask-video
+python scripts/demo_rollouts.py prune                # 先列出要删什么（不删）
+python scripts/demo_rollouts.py prune --yes          # 真删没保留的
+python scripts/demo_rollouts.py prune --keep-last 3 --yes   # 再额外留最近三次
+```
+
+保留标记是录像目录里的空文件 `KEEP`，跟着目录走，移动不丢。工具只管含
+`rollout.json` 的目录，所以 `--record-video` 产生的诊断录像不会被误删。
 
 ### RTC 实验性异步推理（arXiv:2506.07339，暂禁真机）
 

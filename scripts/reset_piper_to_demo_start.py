@@ -44,6 +44,18 @@ _DEFAULT_STEP_DEG = 15.0
 # --step-deg 拆成受监控的小段。需要额外限制总跨度时可显式传正数。
 _DEFAULT_MAX_START_GAP_DEG = 0.0
 
+# 固定示教起点：stack cups 的 0.hdf5 首帧，2026-08-06 一次性读出来写死在这里。
+# 之前每次复位都要在本机留一份 HDF5 才能跑，而这个位姿从来不变，为它保留 146MB
+# 数据（以及"数据不在就复位不了"这个失败模式）不值得。要用别的起点仍可 --dataset
+# 指向真实数据集，逻辑完全不变。
+FIXED_DEMO_START_JOINT = np.array(
+    [-1.433893, 0.004294, -0.002601, 0.262340, 0.224240, -0.203994], dtype=np.float64
+)
+FIXED_DEMO_START_EEF = np.array(
+    [0.012811, -0.054544, 0.194241, 2.716553, 1.426894, 1.336940], dtype=np.float64
+)
+FIXED_DEMO_START_ARM = "right_arm"
+
 
 @dataclass(frozen=True)
 class DemoStart:
@@ -55,6 +67,19 @@ class DemoStart:
     @property
     def episode(self):
         return os.path.splitext(os.path.basename(self.path))[0]
+
+
+def _fixed_demo_start():
+    """写死的示教起点，不读任何文件。"""
+    deg = np.degrees(FIXED_DEMO_START_JOINT)
+    if np.any(deg < _JOINT_LIMITS_DEG[:, 0]) or np.any(deg > _JOINT_LIMITS_DEG[:, 1]):
+        raise ValueError(f"固定示教起点超出 Piper 限位：{deg}")
+    return [
+        DemoStart(
+            "<fixed>", FIXED_DEMO_START_ARM,
+            FIXED_DEMO_START_JOINT.copy(), FIXED_DEMO_START_EEF.copy(),
+        )
+    ]
 
 
 def _joint_feedback(sdk):
@@ -439,7 +464,9 @@ def _parse_args():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--dataset", default="datasets/stack cups")
+    ap.add_argument("--dataset", default=None,
+                    help="从这个目录的 HDF5 首帧取起点；不传就用写死的固定起点，"
+                         "不需要本机存任何数据")
     ap.add_argument("--arm", default=None, help="HDF5 中的机械臂名；默认优先 right_arm")
     ap.add_argument("--episode", type=int, default=None, help="固定 episode；默认自动选最近首帧")
     ap.add_argument(
@@ -516,8 +543,17 @@ def main():
     args = _parse_args()
     # --route 要用其他 episode 首帧当中间点，必须全量读；否则指定了 episode 就
     # 只读那一个（"最近的示教首帧"参考列表随之只剩选中项，不影响实际动作）。
-    only = args.episode if (args.episode is not None and not args.route) else None
-    starts = _load_demo_starts(args.dataset, args.arm, only_episode=only)
+    if args.dataset is None:
+        if args.episode is not None or args.route:
+            raise SystemExit(
+                "--episode / --route 需要真实数据集；用 --dataset 指定，"
+                "或去掉这两个开关走固定起点"
+            )
+        starts = _fixed_demo_start()
+        print(f"起点：固定值（不读数据集）{np.degrees(starts[0].joint).round(3)}°")
+    else:
+        only = args.episode if (args.episode is not None and not args.route) else None
+        starts = _load_demo_starts(args.dataset, args.arm, only_episode=only)
 
     if args.current_deg is not None:
         current = np.radians(np.asarray(args.current_deg, dtype=np.float64))

@@ -47,6 +47,7 @@ class LoopConfig:
     chunk_base: str = "recursive"
     gripper_mode: str = "raw"
     gripper_rate: float | None = None
+    gripper_squeeze: float = 0.0
     guard: object | None = None
     guard_tracking: bool = True
     resync: float | None = None
@@ -87,6 +88,7 @@ def run_sync(session, config: LoopConfig, view=None) -> str:
         chunk_base=config.chunk_base,
         gripper_mode=config.gripper_mode,
         gripper_rate=config.gripper_rate,
+        gripper_squeeze=config.gripper_squeeze,
         guard=config.guard,
         trace=trace,
         resync_tracking_err=config.resync,
@@ -204,6 +206,7 @@ def run_rtc(session, config: LoopConfig, view=None) -> str:
         chunk_base=config.chunk_base,
         gripper_mode=config.gripper_mode,
         gripper_rate=config.gripper_rate,
+        gripper_squeeze=config.gripper_squeeze,
         guard=config.guard,
         trace=trace,
         resync_tracking_err=config.resync,
@@ -226,7 +229,7 @@ def run_rtc(session, config: LoopConfig, view=None) -> str:
                 0, kind="sent",
             )
         response = None
-        warm_latency = None
+        warm_samples = []
         for warmup in range(config.warmup_rounds):
             started = time.monotonic()
             response = _rtc_response(
@@ -235,9 +238,17 @@ def run_rtc(session, config: LoopConfig, view=None) -> str:
                 ).result(timeout=config.request_timeout),
                 config.action_space,
             )
-            warm_latency = time.monotonic() - started
-            log(tag, f"warmup {warmup + 1}/{config.warmup_rounds}: {warm_latency:.3f}s", "INFO")
-        assert response is not None and warm_latency is not None
+            sample = time.monotonic() - started
+            warm_samples.append(sample)
+            log(tag, f"warmup {warmup + 1}/{config.warmup_rounds}: {sample:.3f}s", "INFO")
+        assert response is not None and warm_samples
+        # 取最小值而不是最后一次：首轮必然包含 CUDA/cuDNN 初始化、TCP 慢启动这类
+        # 一次性瞬态，用它推出的 d_init 会凭空虚高一倍，把本来跑得动的配置判死。
+        # 稳态才是 RTC 要满足的条件；真实延迟由运行中的滚动最大值持续兜底。
+        warm_latency = min(warm_samples)
+        if len(warm_samples) > 1 and max(warm_samples) > 1.5 * warm_latency:
+            log(tag, f"warmup 抖动明显（{max(warm_samples):.3f}s vs {warm_latency:.3f}s），"
+                     f"按稳态 {warm_latency:.3f}s 估 d_init", "INFO")
 
         horizon = int(response["prediction_horizon"])
         max_delay = min(config.horizon, horizon - config.horizon)

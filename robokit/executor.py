@@ -29,21 +29,30 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from robokit.arms.base import ArmCommandRejected
-from robokit.pose import apply_local_delta_pose, wrap_euler
+from robokit.pose import apply_base_delta_pose, apply_local_delta_pose, wrap_euler
 from robokit.safety import GuardViolation
 
 BASE_MODES = ("feedback", "recursive", "continuous")
 GRIPPER_MODES = ("raw", "binary", "hysteresis")
 
 
-def apply_eef_delta(current, delta, wrap_target=False):
-    """对当前 EEF 位姿应用局部增量，返回要下发的目标位姿。
+def apply_eef_delta(current, delta, wrap_target=False, frame="local"):
+    """对当前 EEF 位姿应用增量，返回要下发的目标位姿。
 
-    用 apply_local_delta_pose（局部坐标系变换），与 RLDS 转换生成训练动作时用的
-    local_delta_pose 严格互逆。旧 memoryvla_client.py 当年用的是逐元素相加
-    current+delta（近似，仅当基座姿态≈0 时才等价），此处不复刻该近似。
+    frame="local"（默认）用 apply_local_delta_pose（局部坐标系变换），与 RLDS 转换
+    生成训练动作时用的 local_delta_pose 严格互逆。旧 memoryvla_client.py 当年用的是
+    逐元素相加 current+delta（近似，仅当基座姿态≈0 时才等价），此处不复刻该近似。
+
+    frame="base" 对应 RLDS 1.2.0/1.3.0 的 `action_delta_base`（OXE / OpenVLA 预训练
+    的约定）：平移直接相加、旋转左乘。两种约定数值不同，必须与 checkpoint 的训练
+    契约一一对应，喂错不会报错、只会走出错误的轨迹。
     """
-    target = apply_local_delta_pose(current, delta)
+    if frame == "base":
+        target = apply_base_delta_pose(current, delta)
+    elif frame == "local":
+        target = apply_local_delta_pose(current, delta)
+    else:
+        raise ValueError(f"frame must be 'local' or 'base', got {frame!r}")
     return wrap_euler(target) if wrap_target else target
 
 
@@ -51,7 +60,8 @@ class ChunkExecutor:
     """按行执行 action chunk。一个 executor 对应一次部署会话，跨 chunk 保持递推基准。
 
     参数:
-        action_space   "eef_delta" | "joint"
+        action_space   "eef_delta"（局部系增量）| "eef_delta_base"（基座系增量，
+                       OXE/OpenVLA 约定）| "joint"
         control_freq   下发频率 Hz
         fixed_control_rate
                        True 时按绝对 deadline 定频，扣除每步软件处理耗时；
@@ -73,7 +83,8 @@ class ChunkExecutor:
 
     def __init__(self, action_space="eef_delta", control_freq=30, horizon=30,
                  chunk_base="recursive", gripper_mode="raw",
-                 gripper_deadband=0.25, gripper_rate=None, guard=None, trace=None,
+                 gripper_deadband=0.25, gripper_rate=None, gripper_squeeze=0.0,
+                 guard=None, trace=None,
                  resync_tracking_err=None, wrap_target=False, wait_arrival=None,
                  arrival_rotation_tol_deg=1.0, arrival_joint_tol_deg=0.5,
                  arrival_stable_s=0.1, guard_tracking=True,
@@ -83,7 +94,13 @@ class ChunkExecutor:
             raise ValueError(f"chunk_base must be one of {BASE_MODES}, got {chunk_base!r}")
         if gripper_mode not in GRIPPER_MODES:
             raise ValueError(f"gripper_mode must be one of {GRIPPER_MODES}, got {gripper_mode!r}")
+        if action_space not in ("eef_delta", "eef_delta_base", "joint"):
+            raise ValueError(
+                "action_space must be 'eef_delta' (局部系增量), 'eef_delta_base' "
+                f"(基座系增量) or 'joint', got {action_space!r}")
         self.action_space = action_space
+        # 增量的参考系由动作空间决定，喂错只会静默走偏，所以在这里定死一次。
+        self._delta_frame = "base" if action_space == "eef_delta_base" else "local"
         self.control_freq = float(control_freq)
         self.fixed_control_rate = bool(fixed_control_rate)
         self.horizon = int(horizon)
@@ -102,6 +119,9 @@ class ChunkExecutor:
             raise ValueError("到位姿态/关节容差必须为正，稳定时间不能为负")
         self.gripper_mode = gripper_mode
         self.gripper_deadband = float(gripper_deadband)
+        self.gripper_squeeze = float(gripper_squeeze)
+        if not 0.0 <= self.gripper_squeeze <= 0.5:
+            raise ValueError(f"gripper_squeeze 应在 [0, 0.5] 内，得到 {self.gripper_squeeze}")
         self.gripper_rate = None if gripper_rate is None else float(gripper_rate)
         self.guard = guard
         self.guard_tracking = bool(guard_tracking)
@@ -124,6 +144,7 @@ class ChunkExecutor:
         self._base = {}        # arm -> 上一条 commanded EEF target
         self._last_target = {}  # arm -> 上一条 commanded target（跟踪误差用）
         self._gripper_cmd = {}  # arm -> 上一条夹爪命令
+        self._gripper_raw = {}  # arm -> 上一条模型原始夹爪输出（判闭合/张开用）
 
     def reset(self):
         """新 episode / 新连接：清空递推基准与迟滞状态（含 guard 的跨步状态）。"""
@@ -132,6 +153,7 @@ class ChunkExecutor:
         self._base.clear()
         self._last_target.clear()
         self._gripper_cmd.clear()
+        self._gripper_raw.clear()
         if self.guard is not None:
             self.guard.reset()
 
@@ -147,6 +169,20 @@ class ChunkExecutor:
         return np.asarray(prev, dtype=np.float64), "commanded"
 
     def _resolve_gripper(self, name, value):
+        # 训练标签是夹爪的**实测**开度（get_state 读 grippers_angle），不是示教端发出的
+        # 指令。抓取时物体把爪挡住，录下来的就是「贴着物体」那个位置；回放这个位置只会
+        # 贴上去、不产生夹持力，于是拿不起来。squeeze 在闭合方向上多压一点，等价于把
+        # 示教时被物体吃掉的那段行程补回来。0 = 关闭（保持原行为）。
+        # 判"在闭合还是在张开"必须跟模型的上一条**原始**输出比，不能跟上一条已加压的
+        # 命令比：加压后的命令比原始值小，下一帧原始值就显得"变大了"而被当成张开，
+        # 于是夹持期间会在加压/不加压之间来回跳（实测 0.58 → 0.50 → 0.58 抖动）。
+        prev_raw = self._gripper_raw.get(name)
+        if self.gripper_squeeze > 0.0 and (prev_raw is None or value <= prev_raw + 1e-6):
+            squeezed = value - self.gripper_squeeze
+        else:
+            squeezed = value
+        self._gripper_raw[name] = value
+        value = squeezed
         value = float(np.clip(value, 0.0, 1.0))
         prev = self._gripper_cmd.get(name)
         if self.gripper_mode == "binary":
@@ -230,7 +266,7 @@ class ChunkExecutor:
             base, base_src = np.asarray(feedback, dtype=np.float64), "resync"
 
         delta = np.asarray(action[:6], dtype=np.float64)
-        target = apply_eef_delta(base, delta, self.wrap_target)
+        target = apply_eef_delta(base, delta, self.wrap_target, frame=self._delta_frame)
         gripper_raw = float(action[6])
         gripper = self._resolve_gripper(name, gripper_raw)
 

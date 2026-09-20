@@ -9,35 +9,27 @@
 #   export ROBOKIT_SSH_PASS=...；未设置时走交互式 ssh 密码提示。
 set -euo pipefail
 
-HOST=root@connect.weste.seetacloud.com
-PORT=41815
+# 2026-09-11 起指向 westb 4090 推理机：连接细节（端口、socks ProxyCommand）在 ~/.ssh/config 的
+# `Host westb` 里；直连 kex 阶段会被断，必须走本机 socks 7899。
+HOST=${ROBOKIT_SSH_HOST:-westb}
 LOCAL_REPO=/home/ysh/robokit
-LOCAL_POLICY=/home/ysh/Test_piper/policy/MemoryVLA-openvla-codebase
+# MemoryVLA 代码库现在 vendor 在仓库里（vendor/MemoryVLA-openvla-codebase），随代码一起推
 REMOTE_REPO=/root/robokit
-REMOTE_POLICY=/root/autodl-tmp/MemoryVLA-openvla-codebase
 
-SSH="ssh -p ${PORT} -o StrictHostKeyChecking=no"
+SSH="ssh -o StrictHostKeyChecking=no"
 RUN=()
 if [[ -n "${ROBOKIT_SSH_PASS:-}" ]]; then
   command -v sshpass >/dev/null || { echo "需要 sshpass" >&2; exit 1; }
   RUN=(sshpass -p "${ROBOKIT_SSH_PASS}")
 fi
 
-EXCLUDES=(--exclude='__pycache__/' --exclude='datasets/' --exclude='*.hdf5'
+EXCLUDES=(--exclude='__pycache__/' --exclude='datasets/' --exclude='hf/' --exclude='*.hdf5'
           --exclude='.git/' --exclude='*.egg-info/' --exclude='*.pt' --exclude='*.pth')
 
 push() {
   echo "==> 代码 -> ${REMOTE_REPO}"
   "${RUN[@]}" rsync -az --delete "${EXCLUDES[@]}" -e "${SSH}" \
     "${LOCAL_REPO}/" "${HOST}:${REMOTE_REPO}/"
-  if [[ -d "${LOCAL_POLICY}" ]]; then
-    # pretrained/ 下是服务器独有的 33 GB checkpoint 及其同目录元数据，本机没有对应文件。
-    # 必须先 --filter 保护再 --delete，否则整个 laMem-VLA 目录会被当成「多余文件」删掉。
-    echo "==> MemoryVLA 代码库 -> ${REMOTE_POLICY}（保护 pretrained/）"
-    "${RUN[@]}" rsync -az --delete --filter='protect pretrained/***' \
-      "${EXCLUDES[@]}" --exclude='wandb/' -e "${SSH}" \
-      "${LOCAL_POLICY}/" "${HOST}:${REMOTE_POLICY}/"
-  fi
   echo "==> 完成"
 }
 
@@ -56,9 +48,9 @@ status() {
   git -C "${LOCAL_REPO}" status --short
   echo "==> 服务器文件校验和"
   "${RUN[@]}" ${SSH} "${HOST}" \
-    "cd ${REMOTE_REPO} && sha256sum PROJECT_MEMORY.md TASK_STATE.md scripts/deploy_server.py robokit/policies/memoryvla.py 2>/dev/null"
+    "cd ${REMOTE_REPO} && sha256sum PROJECT_MEMORY.md TASK_STATE.md scripts/serve_policy.py robokit/policies/memoryvla.py 2>/dev/null"
   echo "==> 本机对应校验和"
-  (cd "${LOCAL_REPO}" && sha256sum PROJECT_MEMORY.md TASK_STATE.md scripts/deploy_server.py robokit/policies/memoryvla.py)
+  (cd "${LOCAL_REPO}" && sha256sum PROJECT_MEMORY.md TASK_STATE.md scripts/serve_policy.py robokit/policies/memoryvla.py)
 }
 
 case "${1:-push}" in

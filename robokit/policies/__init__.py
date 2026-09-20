@@ -18,6 +18,8 @@ import importlib
 REGISTRY = {
     # 无模型联调：回发当前状态，不需要 GPU
     "dummy": "robokit.policies.dummy:DummyPolicy",
+    # MemoryVLA 全量 checkpoint（laMem-VLA 这类 33.5 GB 的 .pt），输出 16 步动作块
+    "memoryvla": "robokit.policies.memoryvla:MemoryVLAPolicy",
     # MemoryVLA(CogACT-Large) + LoRA。输出动作块，--horizon 可 >1
     "memvla_lora": "robokit.policies.memvla_lora:MemVLALoRAPolicy",
     "openvla_oft": "robokit.policies.openvla_oft:OpenVLAOFTPolicy",

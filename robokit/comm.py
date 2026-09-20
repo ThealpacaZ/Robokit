@@ -3,7 +3,36 @@ import pickle
 import socket
 from threading import Event, Thread
 
+import numpy as np
+
 from robokit.utils import log
+
+# 走隧道/代理时原始帧（640x480x3 ≈ 900KB）一次往返要几百毫秒，是 RTC deadline 的
+# 主要开销；JPEG 后 ~70KB。编解码走同一套约定，通道序不翻转，往返后布局不变。
+JPEG_KEY = "__jpeg__"
+JPEG_QUALITY = 90
+
+
+def encode_image_jpeg(image, quality: int = JPEG_QUALITY) -> dict:
+    import cv2
+
+    array = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
+    ok, buffer = cv2.imencode(".jpg", array, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    if not ok:
+        raise RuntimeError(f"JPEG encode failed for image shape={array.shape}")
+    return {JPEG_KEY: buffer.tobytes()}
+
+
+def decode_image_maybe_jpeg(obj):
+    """服务端入口：新客户端发 JPEG dict，旧客户端发原始数组，两者都接。"""
+    if isinstance(obj, dict) and JPEG_KEY in obj:
+        import cv2
+
+        image = cv2.imdecode(np.frombuffer(obj[JPEG_KEY], dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError("JPEG decode failed")
+        return image
+    return obj
 
 
 class RequestClient:
